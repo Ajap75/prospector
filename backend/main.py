@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from db import get_db  # 👈 nouveau
 from pydantic import BaseModel
 from fastapi import HTTPException
+from typing import Optional
+
 
 
 app = FastAPI()
@@ -32,19 +34,46 @@ def read_root():
 
 
 @app.get("/dpe")
-def get_dpe():
-    """
-    Lit les DPE depuis la base PostgreSQL et les renvoie au frontend.
-    """
+def get_dpe(zone_id: Optional[int] = None):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, address, surface_m2, diagnostic_date, latitude, longitude, status
-                FROM dpe_targets
-                ORDER BY id;
-            """
-            )
+            if zone_id is not None:
+                # On récupère la zone demandée
+                cur.execute(
+                    """
+                    SELECT min_lat, max_lat, min_lng, max_lng
+                    FROM zones
+                    WHERE id = %s
+                    """,
+                    (zone_id,),
+                )
+                zone = cur.fetchone()
+                if zone is None:
+                    raise HTTPException(status_code=404, detail="Zone non trouvée")
+
+                min_lat, max_lat, min_lng, max_lng = zone
+
+                # On récupère uniquement les DPE dans cette zone
+                cur.execute(
+                    """
+                    SELECT id, address, surface_m2, diagnostic_date, latitude, longitude, status
+                    FROM dpe_targets
+                    WHERE latitude BETWEEN %s AND %s
+                      AND longitude BETWEEN %s AND %s
+                    ORDER BY id;
+                    """,
+                    (min_lat, max_lat, min_lng, max_lng),
+                )
+            else:
+                # Comportement par défaut : tous les DPE
+                cur.execute(
+                    """
+                    SELECT id, address, surface_m2, diagnostic_date, latitude, longitude, status
+                    FROM dpe_targets
+                    ORDER BY id;
+                    """
+                )
+
             rows = cur.fetchall()
 
     items = []
@@ -61,6 +90,7 @@ def get_dpe():
         items.append(dpe)
 
     return {"items": items}
+
 
 
 @app.post("/dpe/{dpe_id}/status")
@@ -81,3 +111,79 @@ def update_dpe_status(dpe_id: int, payload: DpeStatusUpdate):
         conn.commit()
 
     return {"success": True, "id": dpe_id, "status": new_status}
+
+
+@app.get("/zones")
+def list_zones():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM zones ORDER BY id;")
+            rows = cur.fetchall()
+
+    return {"items": [{"id": r[0], "name": r[1]} for r in rows]}
+
+
+class NoteCreate(BaseModel):
+    address: str
+    content: str
+    dpe_id: Optional[int] = None
+    pinned: bool = False
+    tags: Optional[str] = None
+
+@app.post("/notes")
+def create_note(payload: NoteCreate):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO notes (dpe_id, address, content, tags, pinned)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, dpe_id, address, content, tags, pinned, created_at;
+                """,
+                (payload.dpe_id, payload.address, payload.content, payload.tags, payload.pinned),
+            )
+            row = cur.fetchone()
+            conn.commit()
+
+    return {
+        "item": {
+            "id": row[0],
+            "dpe_id": row[1],
+            "address": row[2],
+            "content": row[3],
+            "tags": row[4],
+            "pinned": row[5],
+            "created_at": row[6].isoformat(),
+        }
+    }
+
+@app.get("/notes")
+def list_notes(address: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, dpe_id, address, content, tags, pinned, created_at
+                FROM notes
+                WHERE address = %s
+                ORDER BY pinned DESC, created_at DESC;
+                """,
+                (address,),
+            )
+            rows = cur.fetchall()
+
+    return {
+        "items": [
+            {
+                "id": r[0],
+                "dpe_id": r[1],
+                "address": r[2],
+                "content": r[3],
+                "tags": r[4],
+                "pinned": r[5],
+                "created_at": r[6].isoformat(),
+            }
+            for r in rows
+        ]
+    }
+
