@@ -1,15 +1,21 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from db import get_db  # 👈 nouveau
-from pydantic import BaseModel
-from fastapi import HTTPException
+from __future__ import annotations
+
+from datetime import datetime
 from typing import Optional
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+from db import get_db
+
+
+# -----------------------------------------------------------------------------
+# App + Middleware
+# -----------------------------------------------------------------------------
 
 app = FastAPI()
 
-# 👇 On autorise ton frontend à appeler ton backend
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -17,101 +23,42 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # seules ces origines sont autorisées
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # toutes les méthodes (GET, POST, etc.)
-    allow_headers=["*"],  # tous les headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
+# -----------------------------------------------------------------------------
+# Pydantic Models (MUST be defined before routes)
+# -----------------------------------------------------------------------------
+
 class DpeStatusUpdate(BaseModel):
     status: str
+    next_action_at: Optional[datetime] = None
 
+
+class NoteCreate(BaseModel):
+    address: str
+    content: str
+    dpe_id: Optional[int] = None
+    pinned: bool = False
+    tags: Optional[str] = None
+
+
+# -----------------------------------------------------------------------------
+# Healthcheck
+# -----------------------------------------------------------------------------
 
 @app.get("/")
 def read_root():
     return {"message": "PROSPECTOR backend is running"}
 
 
-@app.get("/dpe")
-def get_dpe(zone_id: Optional[int] = None):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            if zone_id is not None:
-                # On récupère la zone demandée
-                cur.execute(
-                    """
-                    SELECT min_lat, max_lat, min_lng, max_lng
-                    FROM zones
-                    WHERE id = %s
-                    """,
-                    (zone_id,),
-                )
-                zone = cur.fetchone()
-                if zone is None:
-                    raise HTTPException(status_code=404, detail="Zone non trouvée")
-
-                min_lat, max_lat, min_lng, max_lng = zone
-
-                # On récupère uniquement les DPE dans cette zone
-                cur.execute(
-                    """
-                    SELECT id, address, surface_m2, diagnostic_date, latitude, longitude, status
-                    FROM dpe_targets
-                    WHERE latitude BETWEEN %s AND %s
-                      AND longitude BETWEEN %s AND %s
-                    ORDER BY id;
-                    """,
-                    (min_lat, max_lat, min_lng, max_lng),
-                )
-            else:
-                # Comportement par défaut : tous les DPE
-                cur.execute(
-                    """
-                    SELECT id, address, surface_m2, diagnostic_date, latitude, longitude, status
-                    FROM dpe_targets
-                    ORDER BY id;
-                    """
-                )
-
-            rows = cur.fetchall()
-
-    items = []
-    for row in rows:
-        dpe = {
-            "id": row[0],
-            "address": row[1],
-            "surface": float(row[2]) if row[2] is not None else None,
-            "date": row[3].isoformat() if row[3] is not None else None,
-            "latitude": row[4],
-            "longitude": row[5],
-            "status": row[6],
-        }
-        items.append(dpe)
-
-    return {"items": items}
-
-
-
-@app.post("/dpe/{dpe_id}/status")
-def update_dpe_status(dpe_id: int, payload: DpeStatusUpdate):
-    new_status = payload.status
-
-    if new_status not in ["non_traite", "done", "ignore"]:
-        raise HTTPException(status_code=400, detail="Statut invalide")
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE dpe_targets SET status = %s WHERE id = %s",
-                (new_status, dpe_id),
-            )
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="DPE non trouvé")
-        conn.commit()
-
-    return {"success": True, "id": dpe_id, "status": new_status}
-
+# -----------------------------------------------------------------------------
+# Zones
+# -----------------------------------------------------------------------------
 
 @app.get("/zones")
 def list_zones():
@@ -123,39 +70,128 @@ def list_zones():
     return {"items": [{"id": r[0], "name": r[1]} for r in rows]}
 
 
-class NoteCreate(BaseModel):
-    address: str
-    content: str
-    dpe_id: Optional[int] = None
-    pinned: bool = False
-    tags: Optional[str] = None
-
-@app.post("/notes")
-def create_note(payload: NoteCreate):
+@app.get("/zones/{zone_id}")
+def get_zone(zone_id: int):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO notes (dpe_id, address, content, tags, pinned)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id, dpe_id, address, content, tags, pinned, created_at;
+                SELECT id, name, ST_AsGeoJSON(geom)
+                FROM zones
+                WHERE id = %s
                 """,
-                (payload.dpe_id, payload.address, payload.content, payload.tags, payload.pinned),
+                (zone_id,),
             )
             row = cur.fetchone()
-            conn.commit()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Zone non trouvée")
+    if row[2] is None:
+        raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
 
     return {
         "item": {
             "id": row[0],
-            "dpe_id": row[1],
-            "address": row[2],
-            "content": row[3],
-            "tags": row[4],
-            "pinned": row[5],
-            "created_at": row[6].isoformat(),
+            "name": row[1],
+            "geojson": row[2],  # GeoJSON string
         }
     }
+
+
+# -----------------------------------------------------------------------------
+# DPE Targets
+# -----------------------------------------------------------------------------
+
+@app.get("/dpe")
+def get_dpe(zone_id: Optional[int] = None):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if zone_id is not None:
+                # 1) Zone existe + geom non NULL
+                cur.execute("SELECT geom IS NOT NULL FROM zones WHERE id = %s;", (zone_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Zone non trouvée")
+                if row[0] is False:
+                    raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
+
+                # 2) Filtre spatial par polygone
+                cur.execute(
+                    """
+                    SELECT t.id, t.address, t.surface_m2, t.diagnostic_date,
+                           t.latitude, t.longitude, t.status, t.next_action_at
+                    FROM dpe_targets t
+                    JOIN zones z ON z.id = %s
+                    WHERE ST_Contains(z.geom, t.geom)
+                    ORDER BY t.id;
+                    """,
+                    (zone_id,),
+                )
+            else:
+                # Fallback dev/debug : tout
+                cur.execute(
+                    """
+                    SELECT id, address, surface_m2, diagnostic_date,
+                           latitude, longitude, status, next_action_at
+                    FROM dpe_targets
+                    ORDER BY id;
+                    """
+                )
+
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "id": r[0],
+                "address": r[1],
+                "surface": float(r[2]) if r[2] is not None else None,
+                "date": r[3].isoformat() if r[3] is not None else None,
+                "latitude": r[4],
+                "longitude": r[5],
+                "status": r[6],
+                "next_action_at": r[7].isoformat() if r[7] is not None else None,
+            }
+        )
+
+    return {"items": items}
+
+
+@app.post("/dpe/{dpe_id}/status")
+def update_dpe_status(dpe_id: int, payload: DpeStatusUpdate):
+    new_status = payload.status
+    allowed = ["non_traite", "done", "ignore", "done_repasser"]
+
+    if new_status not in allowed:
+        raise HTTPException(status_code=400, detail="Statut invalide")
+
+    if new_status == "done_repasser" and payload.next_action_at is None:
+        raise HTTPException(status_code=400, detail="next_action_at requis pour done_repasser")
+
+    next_action_at = payload.next_action_at if new_status == "done_repasser" else None
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dpe_targets
+                SET status = %s,
+                    next_action_at = %s
+                WHERE id = %s
+                """,
+                (new_status, next_action_at, dpe_id),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="DPE non trouvé")
+        conn.commit()
+
+    return {"success": True, "id": dpe_id, "status": new_status, "next_action_at": next_action_at}
+
+
+# -----------------------------------------------------------------------------
+# Notes
+# -----------------------------------------------------------------------------
 
 @app.get("/notes")
 def list_notes(address: str):
@@ -187,3 +223,34 @@ def list_notes(address: str):
         ]
     }
 
+
+@app.post("/notes")
+def create_note(payload: NoteCreate):
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Contenu de note vide")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO notes (dpe_id, address, content, tags, pinned)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, dpe_id, address, content, tags, pinned, created_at;
+                """,
+                (payload.dpe_id, payload.address, content, payload.tags, payload.pinned),
+            )
+            row = cur.fetchone()
+        conn.commit()
+
+    return {
+        "item": {
+            "id": row[0],
+            "dpe_id": row[1],
+            "address": row[2],
+            "content": row[3],
+            "tags": row[4],
+            "pinned": row[5],
+            "created_at": row[6].isoformat(),
+        }
+    }
