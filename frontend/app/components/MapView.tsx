@@ -1,9 +1,9 @@
 "use client";
 
-import type { Icon } from "leaflet";
+import type { Icon, Map as LeafletMap, Marker as LeafletMarker } from "leaflet";
 import "leaflet/dist/leaflet.css";
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Target } from "../types";
 import type { GeoJsonObject } from "geojson";
 
@@ -26,6 +26,15 @@ type Props = {
 
   maxPins?: number;
   zoneGeoJson?: GeoJsonObject | null;
+
+  // ✅ focus persist (list click)
+  focusedTargetId?: number | null;
+
+  // ✅ highlight (hover > focus)
+  highlightedTargetId?: number | null;
+
+  // ✅ hover pin -> list highlight
+  onHoverTarget?: (id: number | null) => void;
 };
 
 function isLineString(obj: GeoJsonObject | null): obj is GeoJsonObject {
@@ -41,25 +50,39 @@ export default function MapView({
   tourPolyline,
   maxPins = 60,
   zoneGeoJson,
+  focusedTargetId = null,
+  highlightedTargetId = null,
+  onHoverTarget,
 }: Props) {
   const items = Array.isArray(targets) ? targets : [];
   const actionable = useMemo(() => items.filter((t) => t.status === "non_traite"), [items]);
 
   const tourSet = useMemo(() => new Set(tourIds ?? []), [tourIds]);
 
-  // Pins ordering: tour first, then others, then capped
+  // marker refs for programmatic popup opening
+  const markerRefs = useRef<Record<number, LeafletMarker | null>>({});
+
+  // Pins ordering: tour first, then others (dedup guaranteed), then capped
   const pins = useMemo(() => {
     const tourPins = actionable.filter((t) => tourSet.has(t.id));
+
+    // ✅ exclude tour ids from the rest to guarantee uniqueness
     const otherPins = actionable.filter((t) => !tourSet.has(t.id));
+
     return [...tourPins, ...otherPins].slice(0, maxPins);
   }, [actionable, tourSet, maxPins]);
+
 
   const hasData = pins.length > 0;
   const center: [number, number] = hasData ? [pins[0].latitude, pins[0].longitude] : [48.8566, 2.3522];
 
-  // --- Icons (grey vs blue) ---
+  const [map, setMap] = useState<LeafletMap | null>(null);
+
+  // Icons
   const [iconGrey, setIconGrey] = useState<Icon | undefined>(undefined);
   const [iconBlue, setIconBlue] = useState<Icon | undefined>(undefined);
+  const [iconGreyFocus, setIconGreyFocus] = useState<Icon | undefined>(undefined);
+  const [iconBlueFocus, setIconBlueFocus] = useState<Icon | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,12 +98,14 @@ export default function MapView({
         shadowSize: [41, 41] as [number, number],
       };
 
-      // Default Leaflet marker (blue-ish) is actually "standard".
-      // We’ll use:
-      // - Grey marker for non-tour
-      // - Blue marker for tour
-      //
-      // Using widely used marker set from pointhi/leaflet-color-markers (CDN hosted on GitHub raw).
+      const commonFocus = {
+        ...common,
+        iconSize: [34, 56] as [number, number],
+        iconAnchor: [17, 56] as [number, number],
+        shadowSize: [56, 56] as [number, number],
+      };
+
+
       const grey = L.icon({
         iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-grey.png",
         iconRetinaUrl:
@@ -95,9 +120,25 @@ export default function MapView({
         ...common,
       });
 
+      const greyFocus = L.icon({
+        iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-grey.png",
+        iconRetinaUrl:
+          "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-grey.png",
+        ...commonFocus,
+      });
+
+      const blueFocus = L.icon({
+        iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png",
+        iconRetinaUrl:
+          "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png",
+        ...commonFocus,
+      });
+
       if (!cancelled) {
         setIconGrey(grey);
         setIconBlue(blue);
+        setIconGreyFocus(greyFocus);
+        setIconBlueFocus(blueFocus);
       }
     }
 
@@ -107,12 +148,56 @@ export default function MapView({
     };
   }, []);
 
-  // --- Polyline (convert GeoJSON LineString -> Leaflet latlngs) ---
+  // Fit bounds to zone
+  useEffect(() => {
+    let cancelled = false;
+
+    async function fitToZone() {
+      if (!map || !zoneGeoJson) return;
+
+      const L = await import("leaflet");
+      const layer = L.geoJSON(zoneGeoJson as any);
+      const bounds = layer.getBounds();
+
+      if (!cancelled && bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [24, 24] });
+      }
+    }
+
+    void fitToZone();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [map, zoneGeoJson]);
+
+  // Focus: center + open popup (persist focus only)
+  useEffect(() => {
+    if (!map) return;
+    if (!focusedTargetId) return;
+
+    const t = pins.find((x) => x.id === focusedTargetId);
+    if (!t) return;
+
+    map.setView([t.latitude, t.longitude], Math.max(map.getZoom(), 16), { animate: true });
+
+    const m = markerRefs.current[focusedTargetId];
+    if (m) {
+      window.setTimeout(() => {
+        try {
+          m.openPopup();
+        } catch {
+          // ignore
+        }
+      }, 120);
+    }
+  }, [map, focusedTargetId, pins]);
+
+  // Polyline
   const tourLatLngs = useMemo(() => {
     if (!isLineString(tourPolyline)) return null;
 
     const coords = (tourPolyline as any).coordinates as [number, number][];
-    // GeoJSON coords: [lng, lat] -> Leaflet: [lat, lng]
     const latlngs: [number, number][] = coords.map(([lng, lat]) => [lat, lng]);
     return latlngs.length >= 2 ? latlngs : null;
   }, [tourPolyline]);
@@ -134,10 +219,9 @@ export default function MapView({
         )}
       </div>
 
-      <MapContainer center={center} zoom={13} style={{ height: "100%", width: "100%" }}>
+      <MapContainer center={center} zoom={13} style={{ height: "100%", width: "100%" }} whenCreated={setMap}>
         <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png" />
 
-        {/* Zone overlay (lecture seule) */}
         {zoneGeoJson ? (
           <GeoJSON
             data={zoneGeoJson}
@@ -148,7 +232,6 @@ export default function MapView({
           />
         ) : null}
 
-        {/* ✅ Tour polyline (preview) */}
         {tourLatLngs ? (
           <Polyline
             positions={tourLatLngs}
@@ -161,17 +244,29 @@ export default function MapView({
 
         {pins.map((t) => {
           const inTour = tourSet.has(t.id);
-          const icon = inTour ? iconBlue : iconGrey;
+          const isHighlighted = highlightedTargetId === t.id;
+
+          let icon = inTour ? iconBlue : iconGrey;
+          if (isHighlighted) icon = inTour ? iconBlueFocus : iconGreyFocus;
 
           return (
-            <Marker key={t.id} position={[t.latitude, t.longitude]} icon={icon}>
+            <Marker
+              key={t.id}
+              position={[t.latitude, t.longitude]}
+              icon={icon}
+              ref={(ref) => {
+                markerRefs.current[t.id] = ref ?? null;
+              }}
+              eventHandlers={{
+                mouseover: () => onHoverTarget?.(t.id),
+                mouseout: () => onHoverTarget?.(null),
+              }}
+            >
               <Popup>
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
                     <strong>{t.address}</strong>
-                    {inTour ? (
-                      <span className="px-2 py-0.5 text-xs rounded bg-blue-600 text-white">Tour</span>
-                    ) : null}
+                    {inTour ? <span className="px-2 py-0.5 text-xs rounded bg-blue-600 text-white">Tour</span> : null}
                   </div>
 
                   <div className="text-sm">
@@ -189,7 +284,7 @@ export default function MapView({
                         }}
                         className="px-3 py-1 bg-blue-100 text-blue-900 rounded"
                       >
-                        Remove
+                        Retirer
                       </button>
                     ) : (
                       <button
@@ -200,7 +295,7 @@ export default function MapView({
                         }}
                         className="px-3 py-1 bg-blue-600 text-white rounded"
                       >
-                        Add
+                        Ajouter
                       </button>
                     )}
 
