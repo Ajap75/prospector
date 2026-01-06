@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +45,17 @@ class NoteCreate(BaseModel):
     dpe_id: Optional[int] = None
     pinned: bool = False
     tags: Optional[str] = None
+
+
+# --- Tour / Route (MVP) ---
+
+class AutoRouteRequest(BaseModel):
+    zone_id: int
+
+
+class AutoRouteResponse(BaseModel):
+    target_ids_ordered: List[int]
+    polyline: Optional[Dict[str, Any]] = None  # GeoJSON LineString
 
 
 # -----------------------------------------------------------------------------
@@ -187,6 +198,75 @@ def update_dpe_status(dpe_id: int, payload: DpeStatusUpdate):
         conn.commit()
 
     return {"success": True, "id": dpe_id, "status": new_status, "next_action_at": next_action_at}
+
+
+# -----------------------------------------------------------------------------
+# Route / Tour (MVP)
+# -----------------------------------------------------------------------------
+
+@app.post("/route/auto")
+def route_auto(payload: AutoRouteRequest):
+    zone_id = payload.zone_id
+    X = 8
+    POOL_MAX = 50
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # 1) Zone existe + geom non NULL
+            cur.execute("SELECT geom IS NOT NULL FROM zones WHERE id = %s;", (zone_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Zone non trouvée")
+            if row[0] is False:
+                raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
+
+            # 2) Pool = non_traite dans la zone (cap POOL_MAX)
+            cur.execute(
+                """
+                SELECT t.id, t.latitude, t.longitude
+                FROM dpe_targets t
+                JOIN zones z ON z.id = %s
+                WHERE t.status = 'non_traite'
+                  AND ST_Contains(z.geom, t.geom)
+                ORDER BY t.id DESC
+                LIMIT %s;
+                """,
+                (zone_id, POOL_MAX),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return {"target_ids_ordered": [], "polyline": None}
+
+    points = [{"id": r[0], "lat": r[1], "lng": r[2]} for r in rows]
+
+    # Heuristique MVP : "nearest neighbor" successive
+    def dist2(a, b):
+        dx = a["lng"] - b["lng"]
+        dy = a["lat"] - b["lat"]
+        return dx * dx + dy * dy
+
+    ordered = [points[0]]
+    remaining = points[1:]
+
+    while remaining and len(ordered) < X:
+        last = ordered[-1]
+        best_i = 0
+        best_d = dist2(last, remaining[0])
+        for i in range(1, len(remaining)):
+            d = dist2(last, remaining[i])
+            if d < best_d:
+                best_d = d
+                best_i = i
+        ordered.append(remaining.pop(best_i))
+
+    ids = [p["id"] for p in ordered]
+
+    # GeoJSON LineString = [lng, lat]
+    coords = [[p["lng"], p["lat"]] for p in ordered]
+    polyline = {"type": "LineString", "coordinates": coords} if len(coords) >= 2 else None
+
+    return {"target_ids_ordered": ids, "polyline": polyline}
 
 
 # -----------------------------------------------------------------------------

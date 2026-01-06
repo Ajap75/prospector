@@ -1,3 +1,6 @@
+import type { GeoJsonObject } from "geojson";
+
+
 export type TargetStatus = "non_traite" | "done" | "ignore" | "done_repasser"; // done_repasser arrive Bloc 2
 
 export type Target = {
@@ -25,3 +28,10 @@ export type Note = {
   pinned: boolean;
   created_at: string;
 };
+
+export type RouteAutoResponse = {
+  zone_id: number;
+  target_ids_ordered: number[];
+  polyline: GeoJsonObject;
+};
+

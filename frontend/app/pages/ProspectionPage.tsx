@@ -25,6 +25,13 @@ export default function ProspectionPage() {
   // --- Zone overlay ---
   const [zoneGeoJson, setZoneGeoJson] = useState<GeoJsonObject | null>(null);
 
+  // --- Tour state (stateless UI) ---
+  const [tourIds, setTourIds] = useState<number[]>([]);
+  const [tourPolyline, setTourPolyline] = useState<GeoJsonObject | null>(null);
+  const [tourLoading, setTourLoading] = useState(false);
+  const TOUR_MAX = 8;
+
+
   // --- Status rules (MVP) ---
   const isRepasserDue = (t: Target) =>
     t.status === "done_repasser" &&
@@ -34,7 +41,8 @@ export default function ProspectionPage() {
   // ✅ Actifs = non_traite + done_repasser (dû)
   const activeTargets = useMemo(
     () => targets.filter((t) => t.status === "non_traite" || isRepasserDue(t)),
-    [targets] // isRepasserDue stable enough; we keep deps minimal
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [targets]
   );
 
   // ✅ Inactifs = done / ignore / done_repasser (pas encore dû)
@@ -45,6 +53,7 @@ export default function ProspectionPage() {
         if (t.status === "done_repasser" && !isRepasserDue(t)) return true;
         return false;
       }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [targets]
   );
 
@@ -53,6 +62,164 @@ export default function ProspectionPage() {
     () => targets.filter((t) => t.status === "non_traite"),
     [targets]
   );
+
+  // ---------------------------------------------------------------------------
+  // Helpers / Tour logic
+  // ---------------------------------------------------------------------------
+  const isTourEligible = (t: Target) => t.status === "non_traite";
+
+  const toLineString = (ids: number[]): GeoJsonObject | null => {
+    if (ids.length < 2) return null;
+
+    const coords: [number, number][] = [];
+    for (const id of ids) {
+      const t = targets.find((x) => x.id === id);
+      if (!t) continue;
+      // GeoJSON = [lng, lat]
+      coords.push([t.longitude, t.latitude]);
+    }
+    if (coords.length < 2) return null;
+
+    return { type: "LineString", coordinates: coords } as unknown as GeoJsonObject;
+  };
+
+  function removeFromTour(id: number) {
+    setTourIds((prev) => {
+      if (!prev.includes(id)) return prev;
+      const next = prev.filter((x) => x !== id);
+      setTourPolyline(toLineString(next));
+      return next;
+    });
+  }
+
+  const distance2 = (a: Target, b: Target) => {
+    // squared euclidean in degrees (OK for relative ranking MVP)
+    const dx = a.longitude - b.longitude;
+    const dy = a.latitude - b.latitude;
+    return dx * dx + dy * dy;
+  };
+
+  const addToTour = (id: number) => {
+    setTourIds((prev) => {
+      if (prev.includes(id)) return prev;
+
+      if (prev.length >= TOUR_MAX) {
+      alert(`Tournée pleine (${TOUR_MAX}/${TOUR_MAX})`);
+      return prev;
+      }
+
+      const tNew = targets.find((x) => x.id === id);
+      if (!tNew || !isTourEligible(tNew)) return prev;
+
+      // If empty, just add
+      if (prev.length === 0) {
+        const next = [id];
+        setTourPolyline(toLineString(next));
+        return next;
+      }
+
+      // Build ordered targets for current tour
+      const tourTargets: Target[] = prev
+        .map((tid) => targets.find((x) => x.id === tid))
+        .filter(Boolean) as Target[];
+
+      // If we lost some targets in state, append safely
+      if (tourTargets.length !== prev.length) {
+        const next = [...prev, id];
+        setTourPolyline(toLineString(next));
+        return next;
+      }
+
+      // Find best insertion index by minimal delta
+      let bestIdx = 0;
+      let bestDelta = Number.POSITIVE_INFINITY;
+
+      // insertion at beginning
+      {
+        const a = tNew;
+        const b = tourTargets[0];
+        const delta = distance2(a, b);
+        bestDelta = delta;
+        bestIdx = 0;
+      }
+
+      // insertion between i and i+1
+      for (let i = 0; i < tourTargets.length - 1; i++) {
+        const A = tourTargets[i];
+        const B = tourTargets[i + 1];
+        const delta = distance2(A, tNew) + distance2(tNew, B) - distance2(A, B);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          bestIdx = i + 1;
+        }
+      }
+
+      // insertion at end
+      {
+        const A = tourTargets[tourTargets.length - 1];
+        const delta = distance2(A, tNew);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          bestIdx = tourTargets.length;
+        }
+      }
+
+      const next = [...prev.slice(0, bestIdx), id, ...prev.slice(bestIdx)];
+      setTourPolyline(toLineString(next));
+      return next;
+    });
+  };
+
+  const startAutoTour = async () => {
+    // Toggle behavior: if tour exists => clear
+    if (tourIds.length > 0) {
+      setTourIds([]);
+      setTourPolyline(null);
+      return;
+    }
+
+    try {
+      setTourLoading(true);
+      const res = await fetch(`${API_BASE}/route/auto`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ zone_id: zoneId }),
+      });
+
+      if (!res.ok) {
+        alert("Erreur backend : tournée non générée");
+        return;
+      }
+
+      const data = await res.json();
+      const ids: number[] = data.target_ids_ordered ?? [];
+      const poly = (data.polyline ?? null) as GeoJsonObject | null;
+
+      setTourIds(ids);
+      setTourPolyline(poly);
+    } catch (e) {
+      console.error("POST /route/auto failed", e);
+      alert("Erreur : tournée non générée");
+    } finally {
+      setTourLoading(false);
+    }
+  };
+
+  const tourSet = useMemo(() => new Set(tourIds), [tourIds]);
+
+  const activeTargetsTourFirst = useMemo(() => {
+    if (tourIds.length === 0) return activeTargets;
+
+    const byId = new Map(activeTargets.map((t) => [t.id, t]));
+    const tourOrdered: Target[] = [];
+    for (const id of tourIds) {
+      const t = byId.get(id);
+      if (t) tourOrdered.push(t);
+    }
+
+    const rest = activeTargets.filter((t) => !tourSet.has(t.id));
+    return [...tourOrdered, ...rest];
+  }, [activeTargets, tourIds, tourSet]);
 
   // ---------------------------------------------------------------------------
   // 1) Load zones once (source de vérité initiale)
@@ -100,6 +267,10 @@ export default function ProspectionPage() {
 
     async function loadTargets() {
       try {
+        // Clear tour when zone changes (contractual context switch)
+        setTourIds([]);
+        setTourPolyline(null);
+
         setTargets([]);
 
         const res = await fetch(`${API_BASE}/dpe?zone_id=${zoneId}`, { cache: "no-store" });
@@ -165,11 +336,7 @@ export default function ProspectionPage() {
   // ---------------------------------------------------------------------------
   // Write path: Status update (single path)
   // ---------------------------------------------------------------------------
-  const updateStatus = async (
-    id: number,
-    status: Target["status"],
-    nextActionAt: string | null = null
-  ) => {
+  const updateStatus = async (id: number, status: Target["status"], nextActionAt: string | null = null) => {
     const body: Record<string, unknown> = { status };
     if (status === "done_repasser") body.next_action_at = nextActionAt;
 
@@ -196,6 +363,11 @@ export default function ProspectionPage() {
           : t
       )
     );
+
+    // If target is no longer actionable, remove from tour
+    if (status !== "non_traite") {
+      removeFromTour(id);
+    }
   };
 
   const repasserInDays = async (id: number, days: number) => {
@@ -279,8 +451,13 @@ export default function ProspectionPage() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-10 items-start">
         <div className="space-y-8">
           <TargetList
-            activeTargets={activeTargets}
+            activeTargets={activeTargetsTourFirst}
             inactiveTargets={inactiveTargets}
+            tourIds={tourIds}
+            tourLoading={tourLoading}
+            onAutoTour={startAutoTour}
+            onAddToTour={addToTour}
+            onRemoveFromTour={removeFromTour}
             onDone={(id) => updateStatus(id, "done")}
             onRepasser={(id, days) => repasserInDays(id, days)}
             onIgnore={(id) => updateStatus(id, "ignore")}
@@ -307,6 +484,10 @@ export default function ProspectionPage() {
           <MapView
             targets={actionableTargetsForMap}
             onOpenNotes={openAddressNotes}
+            onAddToTour={addToTour}
+            onRemoveFromTour={removeFromTour}
+            tourIds={tourIds}
+            tourPolyline={tourPolyline}
             maxPins={60}
             zoneGeoJson={zoneGeoJson}
           />

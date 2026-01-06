@@ -7,79 +7,137 @@ import { useEffect, useMemo, useState } from "react";
 import type { Target } from "../types";
 import type { GeoJsonObject } from "geojson";
 
-
 const MapContainer = dynamic(() => import("react-leaflet").then((m) => m.MapContainer), { ssr: false });
 const TileLayer = dynamic(() => import("react-leaflet").then((m) => m.TileLayer), { ssr: false });
 const Marker = dynamic(() => import("react-leaflet").then((m) => m.Marker), { ssr: false });
 const Popup = dynamic(() => import("react-leaflet").then((m) => m.Popup), { ssr: false });
 const GeoJSON = dynamic(() => import("react-leaflet").then((m) => m.GeoJSON), { ssr: false });
+const Polyline = dynamic(() => import("react-leaflet").then((m) => m.Polyline), { ssr: false });
 
 type Props = {
-  targets: Target[]; // actionnables
+  targets: Target[]; // actionnables (non_traite)
   onOpenNotes: (address: string) => void;
+
+  onAddToTour: (id: number) => void;
+  onRemoveFromTour: (id: number) => void;
+
+  tourIds: number[];
+  tourPolyline: GeoJsonObject | null;
+
   maxPins?: number;
   zoneGeoJson?: GeoJsonObject | null;
 };
 
+function isLineString(obj: GeoJsonObject | null): obj is GeoJsonObject {
+  return !!obj && (obj as any).type === "LineString" && Array.isArray((obj as any).coordinates);
+}
+
 export default function MapView({
   targets,
   onOpenNotes,
+  onAddToTour,
+  onRemoveFromTour,
+  tourIds,
+  tourPolyline,
   maxPins = 60,
   zoneGeoJson,
 }: Props) {
   const items = Array.isArray(targets) ? targets : [];
   const actionable = useMemo(() => items.filter((t) => t.status === "non_traite"), [items]);
 
-  const pins = useMemo(() => actionable.slice(0, maxPins), [actionable, maxPins]);
+  const tourSet = useMemo(() => new Set(tourIds ?? []), [tourIds]);
+
+  // Pins ordering: tour first, then others, then capped
+  const pins = useMemo(() => {
+    const tourPins = actionable.filter((t) => tourSet.has(t.id));
+    const otherPins = actionable.filter((t) => !tourSet.has(t.id));
+    return [...tourPins, ...otherPins].slice(0, maxPins);
+  }, [actionable, tourSet, maxPins]);
 
   const hasData = pins.length > 0;
   const center: [number, number] = hasData ? [pins[0].latitude, pins[0].longitude] : [48.8566, 2.3522];
 
-  const [icon, setIcon] = useState<Icon | undefined>(undefined);
+  // --- Icons (grey vs blue) ---
+  const [iconGrey, setIconGrey] = useState<Icon | undefined>(undefined);
+  const [iconBlue, setIconBlue] = useState<Icon | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function loadIcon() {
+    async function loadIcons() {
       const L = await import("leaflet");
-      const created = L.icon({
-        iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
-        iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+
+      const common = {
         shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
-        iconSize: [25, 41],
-        iconAnchor: [12, 41],
-        popupAnchor: [1, -34],
-        shadowSize: [41, 41],
+        iconSize: [25, 41] as [number, number],
+        iconAnchor: [12, 41] as [number, number],
+        popupAnchor: [1, -34] as [number, number],
+        shadowSize: [41, 41] as [number, number],
+      };
+
+      // Default Leaflet marker (blue-ish) is actually "standard".
+      // We’ll use:
+      // - Grey marker for non-tour
+      // - Blue marker for tour
+      //
+      // Using widely used marker set from pointhi/leaflet-color-markers (CDN hosted on GitHub raw).
+      const grey = L.icon({
+        iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-grey.png",
+        iconRetinaUrl:
+          "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-grey.png",
+        ...common,
       });
 
-      if (!cancelled) setIcon(created);
+      const blue = L.icon({
+        iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png",
+        iconRetinaUrl:
+          "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png",
+        ...common,
+      });
+
+      if (!cancelled) {
+        setIconGrey(grey);
+        setIconBlue(blue);
+      }
     }
 
-    if (typeof window !== "undefined") void loadIcon();
+    if (typeof window !== "undefined") void loadIcons();
     return () => {
       cancelled = true;
     };
   }, []);
 
+  // --- Polyline (convert GeoJSON LineString -> Leaflet latlngs) ---
+  const tourLatLngs = useMemo(() => {
+    if (!isLineString(tourPolyline)) return null;
+
+    const coords = (tourPolyline as any).coordinates as [number, number][];
+    // GeoJSON coords: [lng, lat] -> Leaflet: [lat, lng]
+    const latlngs: [number, number][] = coords.map(([lng, lat]) => [lat, lng]);
+    return latlngs.length >= 2 ? latlngs : null;
+  }, [tourPolyline]);
+
   return (
     <div className="w-full h-[600px] rounded-lg overflow-hidden border relative">
-      <div className="absolute top-3 left-3 z-[1000] bg-white/90 border rounded px-3 py-2 text-sm">
+      <div className="absolute top-3 left-3 z-[1000] bg-white/90 border rounded px-3 py-2 text-sm space-y-1">
         {hasData ? (
-          <span>
-            {pins.length} target{pins.length > 1 ? "s" : ""} affiché{pins.length > 1 ? "s" : ""} (max {maxPins})
-          </span>
+          <>
+            <div>
+              {pins.length} target{pins.length > 1 ? "s" : ""} affiché{pins.length > 1 ? "s" : ""} (max {maxPins})
+            </div>
+            <div className="text-xs text-gray-600">
+              Tournée: {tourIds?.length ?? 0} point{(tourIds?.length ?? 0) > 1 ? "s" : ""}
+            </div>
+          </>
         ) : (
           <span className="text-gray-600">Aucun target actionnable dans cette zone</span>
         )}
       </div>
 
       <MapContainer center={center} zoom={13} style={{ height: "100%", width: "100%" }}>
-        <TileLayer
-          attribution="&copy; OpenStreetMap"
-          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
-        />
+        <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png" />
 
-        {/* ✅ Zone overlay (lecture seule) */}
+        {/* Zone overlay (lecture seule) */}
         {zoneGeoJson ? (
           <GeoJSON
             data={zoneGeoJson}
@@ -90,33 +148,78 @@ export default function MapView({
           />
         ) : null}
 
-        {pins.map((t) => (
-          <Marker key={t.id} position={[t.latitude, t.longitude]} icon={icon}>
-            <Popup>
-              <div className="space-y-1">
-                <div>
-                  <strong>{t.address}</strong>
-                </div>
-                <div>{t.surface ?? "—"} m²</div>
-                <div className="text-sm text-gray-600">{t.date ?? ""}</div>
-                <div className="text-sm">Statut : {t.status}</div>
+        {/* ✅ Tour polyline (preview) */}
+        {tourLatLngs ? (
+          <Polyline
+            positions={tourLatLngs}
+            pathOptions={{
+              weight: 4,
+              opacity: 0.9,
+            }}
+          />
+        ) : null}
 
-                <div className="pt-2">
-                  <button
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onOpenNotes(t.address);
-                    }}
-                    className="px-3 py-1 bg-black text-white rounded"
-                  >
-                    Notes
-                  </button>
+        {pins.map((t) => {
+          const inTour = tourSet.has(t.id);
+          const icon = inTour ? iconBlue : iconGrey;
+
+          return (
+            <Marker key={t.id} position={[t.latitude, t.longitude]} icon={icon}>
+              <Popup>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <strong>{t.address}</strong>
+                    {inTour ? (
+                      <span className="px-2 py-0.5 text-xs rounded bg-blue-600 text-white">Tour</span>
+                    ) : null}
+                  </div>
+
+                  <div className="text-sm">
+                    {t.surface ?? "—"} m² · <span className="font-mono">{t.status}</span>
+                  </div>
+                  <div className="text-xs text-gray-600">{t.date ?? ""}</div>
+
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {inTour ? (
+                      <button
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onRemoveFromTour(t.id);
+                        }}
+                        className="px-3 py-1 bg-blue-100 text-blue-900 rounded"
+                      >
+                        Remove
+                      </button>
+                    ) : (
+                      <button
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onAddToTour(t.id);
+                        }}
+                        className="px-3 py-1 bg-blue-600 text-white rounded"
+                      >
+                        Add
+                      </button>
+                    )}
+
+                    <button
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onOpenNotes(t.address);
+                      }}
+                      className="px-3 py-1 bg-black text-white rounded"
+                    >
+                      Notes
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </Popup>
-          </Marker>
-        ))}
+              </Popup>
+            </Marker>
+          );
+        })}
       </MapContainer>
     </div>
   );
