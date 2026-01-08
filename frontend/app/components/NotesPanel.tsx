@@ -1,3 +1,15 @@
+/**
+ * ─────────────────────────────────────────────────────────────
+ * Project : prospector
+ * File    : NotesPanel.tsx
+ * Author  : Antoine Astruc
+ * Email   : antoine@maisonastruc.com
+ * Created : 2026-01-08
+ * License : MIT
+ * ─────────────────────────────────────────────────────────────
+ */
+
+
 "use client";
 
 import type { Note } from "../types";

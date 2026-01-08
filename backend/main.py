@@ -1,14 +1,24 @@
+"""
+─────────────────────────────────────────────────────────────
+Project : prospector
+File    : main.py
+Author  : Antoine Astruc
+Email   : antoine@maisonastruc.fr
+Created : 2026-01-08
+License : MIT
+─────────────────────────────────────────────────────────────
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db import get_db
-
 
 # -----------------------------------------------------------------------------
 # App + Middleware
@@ -29,9 +39,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------------------------------------------------------
+# DEV CONTEXT (no-auth MVP)
+# -----------------------------------------------------------------------------
+# En prod: user_id vient du token/session.
+DEV_USER_ID = 1
+
+TOUR_MAX = 8
+POOL_MAX = 50
 
 # -----------------------------------------------------------------------------
-# Pydantic Models (MUST be defined before routes)
+# Pydantic Models
 # -----------------------------------------------------------------------------
 
 class DpeStatusUpdate(BaseModel):
@@ -45,17 +63,68 @@ class NoteCreate(BaseModel):
     dpe_id: Optional[int] = None
     pinned: bool = False
     tags: Optional[str] = None
+    user_id: Optional[int] = None  # MVP no-auth
 
-
-# --- Tour / Route (MVP) ---
 
 class AutoRouteRequest(BaseModel):
-    zone_id: int
+    user_id: Optional[int] = None  # MVP no-auth
 
 
-class AutoRouteResponse(BaseModel):
-    target_ids_ordered: List[int]
-    polyline: Optional[Dict[str, Any]] = None  # GeoJSON LineString
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def _resolve_user_id(user_id: Optional[int]) -> int:
+    return int(user_id) if user_id is not None else DEV_USER_ID
+
+
+def _get_user_agency(cur, user_id: int) -> int:
+    cur.execute("SELECT agency_id FROM users WHERE id = %s;", (user_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="User inconnu")
+    return row[0]
+
+
+def _user_has_territory(cur, user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM user_territories WHERE user_id = %s LIMIT 1;", (user_id,))
+    return cur.fetchone() is not None
+
+
+def _get_primary_agency_zone(cur, agency_id: int) -> Optional[int]:
+    """
+    MVP: une agence (BU) a 1+ zones; on prend la première.
+    Plus tard: agence peut en avoir plusieurs + UI manager.
+    """
+    cur.execute(
+        """
+        SELECT zone_id
+        FROM agency_zones
+        WHERE agency_id = %s
+        ORDER BY zone_id ASC
+        LIMIT 1;
+        """,
+        (agency_id,),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _get_zone_geojson(cur, zone_id: int) -> Tuple[int, str, str]:
+    cur.execute(
+        """
+        SELECT id, name, ST_AsGeoJSON(geom)
+        FROM zones
+        WHERE id = %s;
+        """,
+        (zone_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Zone non trouvée")
+    if row[2] is None:
+        raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
+    return row[0], row[1], row[2]
 
 
 # -----------------------------------------------------------------------------
@@ -68,87 +137,76 @@ def read_root():
 
 
 # -----------------------------------------------------------------------------
-# Zones
+# Zone effective (celle de la BU de l'agent)
 # -----------------------------------------------------------------------------
 
-@app.get("/zones")
-def list_zones():
+@app.get("/me/zone")
+def get_my_zone(user_id: Optional[int] = Query(default=None)):
+    uid = _resolve_user_id(user_id)
+
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM zones ORDER BY id;")
-            rows = cur.fetchall()
+            agency_id = _get_user_agency(cur, uid)
+            zone_id = _get_primary_agency_zone(cur, agency_id)
+            if zone_id is None:
+                # Pas de BU-zone = pas de data
+                return {"item": None}
 
-    return {"items": [{"id": r[0], "name": r[1]} for r in rows]}
+            zid, name, geojson = _get_zone_geojson(cur, zone_id)
 
-
-@app.get("/zones/{zone_id}")
-def get_zone(zone_id: int):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, name, ST_AsGeoJSON(geom)
-                FROM zones
-                WHERE id = %s
-                """,
-                (zone_id,),
-            )
-            row = cur.fetchone()
-
-    if row is None:
-        raise HTTPException(status_code=404, detail="Zone non trouvée")
-    if row[2] is None:
-        raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
-
-    return {
-        "item": {
-            "id": row[0],
-            "name": row[1],
-            "geojson": row[2],  # GeoJSON string
-        }
-    }
+    return {"item": {"id": zid, "name": name, "geojson": geojson}}
 
 
 # -----------------------------------------------------------------------------
-# DPE Targets
+# DPE Targets (BU-shared overlay + micro-zone mandatory + surface segmentation)
 # -----------------------------------------------------------------------------
 
 @app.get("/dpe")
-def get_dpe(zone_id: Optional[int] = None):
+def get_dpe(user_id: Optional[int] = Query(default=None)):
+    uid = _resolve_user_id(user_id)
+
     with get_db() as conn:
         with conn.cursor() as cur:
-            if zone_id is not None:
-                # 1) Zone existe + geom non NULL
-                cur.execute("SELECT geom IS NOT NULL FROM zones WHERE id = %s;", (zone_id,))
-                row = cur.fetchone()
-                if row is None:
-                    raise HTTPException(status_code=404, detail="Zone non trouvée")
-                if row[0] is False:
-                    raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
+            agency_id = _get_user_agency(cur, uid)
 
-                # 2) Filtre spatial par polygone
-                cur.execute(
-                    """
-                    SELECT t.id, t.address, t.surface_m2, t.diagnostic_date,
-                           t.latitude, t.longitude, t.status, t.next_action_at
-                    FROM dpe_targets t
-                    JOIN zones z ON z.id = %s
-                    WHERE ST_Contains(z.geom, t.geom)
-                    ORDER BY t.id;
-                    """,
-                    (zone_id,),
-                )
-            else:
-                # Fallback dev/debug : tout
-                cur.execute(
-                    """
-                    SELECT id, address, surface_m2, diagnostic_date,
-                           latitude, longitude, status, next_action_at
-                    FROM dpe_targets
-                    ORDER BY id;
-                    """
-                )
+            # Décision produit: sans micro-zone => ne voit rien
+            if not _user_has_territory(cur, uid):
+                return {"items": []}
 
+            zone_id = _get_primary_agency_zone(cur, agency_id)
+            if zone_id is None:
+                return {"items": []}
+
+            # Projection visible = zone BU ∩ micro-zone user ∩ overlay BU ∩ filtre surface user
+            cur.execute(
+                """
+                SELECT
+                  t.id,
+                  t.address,
+                  t.surface_m2,
+                  t.diagnostic_date,
+                  t.latitude,
+                  t.longitude,
+                  at.status,
+                  at.next_action_at
+                FROM agency_targets at
+                JOIN dpe_targets t ON t.id = at.dpe_target_id
+                JOIN zones z ON z.id = %s
+                JOIN users u ON u.id = %s
+                WHERE at.agency_id = %s
+                  AND ST_Contains(z.geom, t.geom)
+                  AND EXISTS (
+                    SELECT 1
+                    FROM user_territories ut
+                    WHERE ut.user_id = %s
+                      AND ST_Intersects(ut.geom, t.geom)
+                  )
+                  AND (u.min_surface_m2 IS NULL OR t.surface_m2 >= u.min_surface_m2)
+                  AND (u.max_surface_m2 IS NULL OR t.surface_m2 <= u.max_surface_m2)
+                ORDER BY t.id;
+                """,
+                (zone_id, uid, agency_id, uid),
+            )
             rows = cur.fetchall()
 
     items = []
@@ -170,9 +228,14 @@ def get_dpe(zone_id: Optional[int] = None):
 
 
 @app.post("/dpe/{dpe_id}/status")
-def update_dpe_status(dpe_id: int, payload: DpeStatusUpdate):
-    new_status = payload.status
+def update_dpe_status(
+    dpe_id: int,
+    payload: DpeStatusUpdate,
+    user_id: Optional[int] = Query(default=None),
+):
+    uid = _resolve_user_id(user_id)
     allowed = ["non_traite", "done", "ignore", "done_repasser"]
+    new_status = payload.status
 
     if new_status not in allowed:
         raise HTTPException(status_code=400, detail="Statut invalide")
@@ -184,63 +247,78 @@ def update_dpe_status(dpe_id: int, payload: DpeStatusUpdate):
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            agency_id = _get_user_agency(cur, uid)
+
+            # update overlay BU-shared, pas dpe_targets
             cur.execute(
                 """
-                UPDATE dpe_targets
+                UPDATE agency_targets
                 SET status = %s,
-                    next_action_at = %s
-                WHERE id = %s
+                    next_action_at = %s,
+                    updated_at = now()
+                WHERE agency_id = %s
+                  AND dpe_target_id = %s;
                 """,
-                (new_status, next_action_at, dpe_id),
+                (new_status, next_action_at, agency_id, dpe_id),
             )
             if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="DPE non trouvé")
+                raise HTTPException(status_code=404, detail="Target absent de l'overlay agence")
         conn.commit()
 
     return {"success": True, "id": dpe_id, "status": new_status, "next_action_at": next_action_at}
 
 
 # -----------------------------------------------------------------------------
-# Route / Tour (MVP)
+# Auto tour (MVP) - overlay BU + micro-zone + segmentation surface
 # -----------------------------------------------------------------------------
 
 @app.post("/route/auto")
 def route_auto(payload: AutoRouteRequest):
-    zone_id = payload.zone_id
-    X = 8
-    POOL_MAX = 50
+    uid = _resolve_user_id(payload.user_id)
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            # 1) Zone existe + geom non NULL
-            cur.execute("SELECT geom IS NOT NULL FROM zones WHERE id = %s;", (zone_id,))
-            row = cur.fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Zone non trouvée")
-            if row[0] is False:
-                raise HTTPException(status_code=400, detail="Zone non géométrisée (geom NULL)")
+            agency_id = _get_user_agency(cur, uid)
 
-            # 2) Pool = non_traite dans la zone (cap POOL_MAX)
+            if not _user_has_territory(cur, uid):
+                return {"target_ids_ordered": [], "polyline": None}
+
+            zone_id = _get_primary_agency_zone(cur, agency_id)
+            if zone_id is None:
+                return {"target_ids_ordered": [], "polyline": None}
+
             cur.execute(
                 """
                 SELECT t.id, t.latitude, t.longitude
-                FROM dpe_targets t
+                FROM agency_targets at
+                JOIN dpe_targets t ON t.id = at.dpe_target_id
                 JOIN zones z ON z.id = %s
-                WHERE t.status = 'non_traite'
+                JOIN users u ON u.id = %s
+                WHERE at.agency_id = %s
+                  AND at.status = 'non_traite'
                   AND ST_Contains(z.geom, t.geom)
+                  AND EXISTS (
+                    SELECT 1
+                    FROM user_territories ut
+                    WHERE ut.user_id = %s
+                      AND ST_Intersects(ut.geom, t.geom)
+                  )
+                  AND (u.min_surface_m2 IS NULL OR t.surface_m2 >= u.min_surface_m2)
+                  AND (u.max_surface_m2 IS NULL OR t.surface_m2 <= u.max_surface_m2)
                 ORDER BY t.id DESC
                 LIMIT %s;
                 """,
-                (zone_id, POOL_MAX),
+                (zone_id, uid, agency_id, uid, POOL_MAX),
             )
             rows = cur.fetchall()
 
     if not rows:
         return {"target_ids_ordered": [], "polyline": None}
 
-    points = [{"id": r[0], "lat": r[1], "lng": r[2]} for r in rows]
+    points = [{"id": r[0], "lat": r[1], "lng": r[2]} for r in rows if r[1] is not None and r[2] is not None]
+    if not points:
+        return {"target_ids_ordered": [], "polyline": None}
 
-    # Heuristique MVP : "nearest neighbor" successive
     def dist2(a, b):
         dx = a["lng"] - b["lng"]
         dy = a["lat"] - b["lat"]
@@ -249,7 +327,7 @@ def route_auto(payload: AutoRouteRequest):
     ordered = [points[0]]
     remaining = points[1:]
 
-    while remaining and len(ordered) < X:
+    while remaining and len(ordered) < TOUR_MAX:
         last = ordered[-1]
         best_i = 0
         best_d = dist2(last, remaining[0])
@@ -261,8 +339,6 @@ def route_auto(payload: AutoRouteRequest):
         ordered.append(remaining.pop(best_i))
 
     ids = [p["id"] for p in ordered]
-
-    # GeoJSON LineString = [lng, lat]
     coords = [[p["lng"], p["lat"]] for p in ordered]
     polyline = {"type": "LineString", "coordinates": coords} if len(coords) >= 2 else None
 
@@ -270,21 +346,25 @@ def route_auto(payload: AutoRouteRequest):
 
 
 # -----------------------------------------------------------------------------
-# Notes
+# Notes (BU-shared)
 # -----------------------------------------------------------------------------
 
 @app.get("/notes")
-def list_notes(address: str):
+def list_notes(address: str, user_id: Optional[int] = Query(default=None)):
+    uid = _resolve_user_id(user_id)
+
     with get_db() as conn:
         with conn.cursor() as cur:
+            agency_id = _get_user_agency(cur, uid)
             cur.execute(
                 """
                 SELECT id, dpe_id, address, content, tags, pinned, created_at
                 FROM notes
-                WHERE address = %s
+                WHERE agency_id = %s
+                  AND address = %s
                 ORDER BY pinned DESC, created_at DESC;
                 """,
-                (address,),
+                (agency_id, address),
             )
             rows = cur.fetchall()
 
@@ -306,19 +386,22 @@ def list_notes(address: str):
 
 @app.post("/notes")
 def create_note(payload: NoteCreate):
+    uid = _resolve_user_id(payload.user_id)
+
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Contenu de note vide")
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            agency_id = _get_user_agency(cur, uid)
             cur.execute(
                 """
-                INSERT INTO notes (dpe_id, address, content, tags, pinned)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO notes (agency_id, dpe_id, address, content, tags, pinned)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id, dpe_id, address, content, tags, pinned, created_at;
                 """,
-                (payload.dpe_id, payload.address, content, payload.tags, payload.pinned),
+                (agency_id, payload.dpe_id, payload.address, content, payload.tags, payload.pinned),
             )
             row = cur.fetchone()
         conn.commit()

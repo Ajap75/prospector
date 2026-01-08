@@ -1,3 +1,16 @@
+/**
+ * ─────────────────────────────────────────────────────────────
+ * Project : prospector
+ * File    : MapView.tsx
+ * Author  : Antoine Astruc
+ * Email   : antoine@maisonastruc.com
+ * Created : 2026-01-08
+ * License : MIT
+ * ─────────────────────────────────────────────────────────────
+ */
+
+
+
 "use client";
 
 import type { Icon, Map as LeafletMap, Marker as LeafletMarker } from "leaflet";

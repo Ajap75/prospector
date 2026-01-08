@@ -1,18 +1,35 @@
-// ProspectionPage.tsx
+/**
+ * ─────────────────────────────────────────────────────────────
+ * Project : prospector
+ * File    : ProspectionPage.tsx
+ * Author  : Antoine Astruc
+ * Email   : antoine@maisonastruc.fr
+ * Created : 2026-01-08
+ * License : MIT
+ * ─────────────────────────────────────────────────────────────
+ */
+
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import type { GeoJsonObject } from "geojson";
 
-import type { Note, Target, Zone } from "../types";
+import type { Note, Target } from "../types";
 import TargetList from "../components/TargetList";
 import MapView from "../components/MapView";
 import NotesPanel from "../components/NotesPanel";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
+// -----------------------------------------------------------------------------
+// MVP no-auth: on simule un user connecté
+// (plus tard: vient du token / session)
+// -----------------------------------------------------------------------------
+const DEV_USER_ID = 4;
+
 const TOUR_MAX = 8;
-const TOUR_STORAGE_KEY = (zoneId: number) => `prospector:tour:${zoneId}`;
+const TOUR_STORAGE_KEY = (userId: number, zoneId: number | null) =>
+  `prospector:tour:u:${userId}:z:${zoneId ?? "none"}`;
 
 function normalizeTourIds(raw: unknown, allTargets: Target[], max = TOUR_MAX): number[] {
   if (!Array.isArray(raw)) return [];
@@ -35,8 +52,11 @@ function normalizeTourIds(raw: unknown, allTargets: Target[], max = TOUR_MAX): n
 export default function ProspectionPage() {
   // --- Core state ---
   const [targets, setTargets] = useState<Target[]>([]);
-  const [zones, setZones] = useState<Zone[]>([]);
-  const [zoneId, setZoneId] = useState<number>(1);
+
+  // --- "effective zone" (BU-zone) ---
+  const [zoneId, setZoneId] = useState<number | null>(null);
+  const [zoneName, setZoneName] = useState<string>("");
+  const [zoneGeoJson, setZoneGeoJson] = useState<GeoJsonObject | null>(null);
 
   // --- Notes state ---
   const [selectedAddress, setSelectedAddress] = useState<string | null>(null);
@@ -44,14 +64,11 @@ export default function ProspectionPage() {
   const [noteContent, setNoteContent] = useState("");
   const [notePinned, setNotePinned] = useState(false);
 
-  // --- Zone overlay ---
-  const [zoneGeoJson, setZoneGeoJson] = useState<GeoJsonObject | null>(null);
-
   // --- Tour state (single source of truth: tourIds) ---
   const [tourIds, setTourIds] = useState<number[]>([]);
   const [tourLoading, setTourLoading] = useState(false);
 
-  // ✅ persistence guard: prevents overwriting localStorage with []
+  // ✅ prevents overwriting localStorage with [] before restore finishes
   const [tourHydrated, setTourHydrated] = useState(false);
 
   // ✅ Focus + Hover
@@ -68,7 +85,10 @@ export default function ProspectionPage() {
     new Date(t.next_action_at).getTime() <= Date.now();
 
   // ✅ Actifs = non_traite + done_repasser (dû)
-  const activeTargets = useMemo(() => targets.filter((t) => t.status === "non_traite" || isRepasserDue(t)), [targets]);
+  const activeTargets = useMemo(
+    () => targets.filter((t) => t.status === "non_traite" || isRepasserDue(t)),
+    [targets]
+  );
 
   // ✅ Inactifs = done / ignore / done_repasser (pas encore dû)
   const inactiveTargets = useMemo(
@@ -82,7 +102,10 @@ export default function ProspectionPage() {
   );
 
   // ✅ Carte = seulement non_traite (actionnables)
-  const actionableTargetsForMap = useMemo(() => targets.filter((t) => t.status === "non_traite"), [targets]);
+  const actionableTargetsForMap = useMemo(
+    () => targets.filter((t) => t.status === "non_traite"),
+    [targets]
+  );
 
   // ---------------------------------------------------------------------------
   // Tour helpers
@@ -174,11 +197,10 @@ export default function ProspectionPage() {
   // Auto tour (backend = suggestion) + reset
   // ---------------------------------------------------------------------------
   const startAutoTour = async () => {
-    // Toggle behavior: if tour exists => reset
     if (tourIds.length > 0) {
       setTourHydrated(true);
       try {
-        localStorage.removeItem(TOUR_STORAGE_KEY(zoneId));
+        localStorage.removeItem(TOUR_STORAGE_KEY(DEV_USER_ID, zoneId));
       } catch {
         // ignore
       }
@@ -192,11 +214,11 @@ export default function ProspectionPage() {
       const res = await fetch(`${API_BASE}/route/auto`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ zone_id: zoneId }),
+        body: JSON.stringify({ user_id: DEV_USER_ID }),
       });
 
       if (!res.ok) {
-        alert("Impossible de générer une tournée automatique pour cette zone.");
+        alert("Impossible de générer une tournée automatique.");
         return;
       }
 
@@ -206,7 +228,7 @@ export default function ProspectionPage() {
       const normalized = normalizeTourIds(rawIds, targets, TOUR_MAX);
 
       if (normalized.length === 0) {
-        alert("Impossible de générer une tournée automatique pour cette zone.");
+        alert("Impossible de générer une tournée automatique.");
         return;
       }
 
@@ -214,7 +236,7 @@ export default function ProspectionPage() {
       setTourIds(normalized);
     } catch (e) {
       console.error("POST /route/auto failed", e);
-      alert("Impossible de générer une tournée automatique pour cette zone.");
+      alert("Impossible de générer une tournée automatique.");
     } finally {
       setTourLoading(false);
     }
@@ -285,50 +307,67 @@ export default function ProspectionPage() {
   }, [activeTargets, tourIds, tourSet]);
 
   // ---------------------------------------------------------------------------
-  // Load zones once
+  // Load effective zone once (agent = 1 zone)
   // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
 
-    async function loadZones() {
+    async function loadMyZone() {
       try {
-        const res = await fetch(`${API_BASE}/zones`, { cache: "no-store" });
+        const res = await fetch(`${API_BASE}/me/zone?user_id=${DEV_USER_ID}`, { cache: "no-store" });
         if (!res.ok) return;
 
         const data = await res.json();
-        const items: Zone[] = data.items ?? [];
+        const item = data?.item ?? null;
 
         if (cancelled) return;
 
-        setZones(items);
-        if (items.length > 0) setZoneId((prev) => (prev ? prev : items[0].id));
+        if (!item) {
+          setZoneId(null);
+          setZoneName("");
+          setZoneGeoJson(null);
+          return;
+        }
+
+        setZoneId(item.id);
+        setZoneName(item.name ?? "");
+
+        if (item.geojson) {
+          try {
+            const parsed = JSON.parse(item.geojson) as GeoJsonObject;
+            setZoneGeoJson(parsed);
+          } catch {
+            setZoneGeoJson(null);
+          }
+        } else {
+          setZoneGeoJson(null);
+        }
       } catch (e) {
-        console.error("Fetch /zones failed", e);
+        console.error("Fetch /me/zone failed", e);
       }
     }
 
-    void loadZones();
+    void loadMyZone();
     return () => {
       cancelled = true;
     };
   }, []);
 
   // ---------------------------------------------------------------------------
-  // Load targets when zone changes
+  // Load targets when zone is known (or whenever you want refresh)
   // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
 
     async function loadTargets() {
       try {
-        // Reset UI + prevent early save overwrite
         setFocusedTargetId(null);
         setHoveredTargetId(null);
         setTourIds([]);
         setTargets([]);
-        setTourHydrated(false); // ✅ critical
+        setTourHydrated(false);
 
-        const res = await fetch(`${API_BASE}/dpe?zone_id=${zoneId}`, { cache: "no-store" });
+        const res = await fetch(`${API_BASE}/dpe?user_id=${DEV_USER_ID}`, { cache: "no-store" });
         if (!res.ok) return;
 
         const data = await res.json();
@@ -340,52 +379,23 @@ export default function ProspectionPage() {
       }
     }
 
-    if (zoneId) void loadTargets();
+    // si pas de BU-zone => pas de data
+    if (zoneId !== null) void loadTargets();
     return () => {
       cancelled = true;
     };
   }, [zoneId]);
 
   // ---------------------------------------------------------------------------
-  // Load zone GeoJSON overlay when zone changes
+  // Restore tour once after targets are loaded
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadZoneGeo() {
-      try {
-        setZoneGeoJson(null);
-
-        const res = await fetch(`${API_BASE}/zones/${zoneId}`, { cache: "no-store" });
-        if (!res.ok) return;
-
-        const data = await res.json();
-        const geojsonStr: string | undefined = data?.item?.geojson;
-        if (!geojsonStr) return;
-
-        const parsed = JSON.parse(geojsonStr) as GeoJsonObject;
-        if (!cancelled) setZoneGeoJson(parsed);
-      } catch (e) {
-        console.error("Failed to load zone geojson:", e);
-      }
-    }
-
-    if (zoneId) void loadZoneGeo();
-    return () => {
-      cancelled = true;
-    };
-  }, [zoneId]);
-
-  // ---------------------------------------------------------------------------
-  // ✅ Restore tour once after targets are loaded, then mark hydrated
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (!zoneId) return;
+    if (zoneId === null) return;
     if (targets.length === 0) return;
     if (tourHydrated) return;
 
     try {
-      const raw = localStorage.getItem(TOUR_STORAGE_KEY(zoneId));
+      const raw = localStorage.getItem(TOUR_STORAGE_KEY(DEV_USER_ID, zoneId));
       if (raw) {
         const parsed = JSON.parse(raw);
         const restored = normalizeTourIds(parsed, targets, TOUR_MAX);
@@ -399,14 +409,14 @@ export default function ProspectionPage() {
   }, [zoneId, targets, tourHydrated]);
 
   // ---------------------------------------------------------------------------
-  // ✅ Save only after hydration (prevents [] overwrite on refresh)
+  // Save tour only after hydration
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!zoneId) return;
+    if (zoneId === null) return;
     if (!tourHydrated) return;
 
     try {
-      localStorage.setItem(TOUR_STORAGE_KEY(zoneId), JSON.stringify(tourIds));
+      localStorage.setItem(TOUR_STORAGE_KEY(DEV_USER_ID, zoneId), JSON.stringify(tourIds));
     } catch {
       // ignore
     }
@@ -419,7 +429,7 @@ export default function ProspectionPage() {
     const body: Record<string, unknown> = { status };
     if (status === "done_repasser") body.next_action_at = nextActionAt;
 
-    const res = await fetch(`${API_BASE}/dpe/${id}/status`, {
+    const res = await fetch(`${API_BASE}/dpe/${id}/status?user_id=${DEV_USER_ID}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -454,9 +464,10 @@ export default function ProspectionPage() {
   // Notes
   // ---------------------------------------------------------------------------
   const loadNotes = async (address: string) => {
-    const res = await fetch(`${API_BASE}/notes?address=${encodeURIComponent(address)}`, {
-      cache: "no-store",
-    });
+    const res = await fetch(
+      `${API_BASE}/notes?address=${encodeURIComponent(address)}&user_id=${DEV_USER_ID}`,
+      { cache: "no-store" }
+    );
     const data = await res.json();
     setNotes(data.items ?? []);
   };
@@ -486,6 +497,7 @@ export default function ProspectionPage() {
         address: selectedAddress,
         content,
         pinned: notePinned,
+        user_id: DEV_USER_ID,
       }),
     });
 
@@ -504,22 +516,10 @@ export default function ProspectionPage() {
   // ---------------------------------------------------------------------------
   return (
     <main className="p-10 space-y-10">
-      <header className="space-y-4">
+      <header className="space-y-2">
         <h1 className="text-4xl font-bold">PROSPECTOR</h1>
-
-        <div className="flex items-center gap-3">
-          <label className="font-medium">Zone :</label>
-          <select
-            className="border rounded px-3 py-2"
-            value={zoneId}
-            onChange={(e) => setZoneId(Number(e.target.value))}
-          >
-            {zones.map((z) => (
-              <option key={z.id} value={z.id}>
-                {z.name}
-              </option>
-            ))}
-          </select>
+        <div className="text-sm text-gray-600">
+          Zone BU : <span className="font-medium">{zoneName || "—"}</span>
         </div>
       </header>
 
@@ -565,7 +565,6 @@ export default function ProspectionPage() {
             />
           </div>
 
-          {/* Notes panel sous la carte */}
           {selectedAddress ? (
             <NotesPanel
               selectedAddress={selectedAddress}

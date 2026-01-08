@@ -1,3 +1,15 @@
+"""
+─────────────────────────────────────────────────────────────
+Project : prospector
+File    : db.py
+Author  : Antoine Astruc
+Email   : antoine@maisonastruc.fr
+Created : 2026-01-08
+License : MIT
+─────────────────────────────────────────────────────────────
+"""
+
+
 import psycopg
 from contextlib import contextmanager
 
