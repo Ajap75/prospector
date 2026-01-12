@@ -11,8 +11,9 @@ License : MIT
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,8 +43,10 @@ app.add_middleware(
 # -----------------------------------------------------------------------------
 # DEV CONTEXT (no-auth MVP)
 # -----------------------------------------------------------------------------
-# En prod: user_id vient du token/session.
 DEV_USER_ID = 1
+
+# MVP: garde-fou admin ultra simple (à remplacer par auth/roles plus tard)
+ADMIN_USER_IDS = {1}  # <-- mets ici le(s) id admin(s)
 
 TOUR_MAX = 8
 POOL_MAX = 50
@@ -70,12 +73,31 @@ class AutoRouteRequest(BaseModel):
     user_id: Optional[int] = None  # MVP no-auth
 
 
+# --- Admin payloads (DB-compatible) ------------------------------------------
+
+class AdminUserCreate(BaseModel):
+    name: str
+    agency_id: int
+    min_surface_m2: Optional[float] = None
+    max_surface_m2: Optional[float] = None
+
+
+class AdminTerritoryUpsert(BaseModel):
+    name: str
+    geojson: Dict[str, Any]  # Polygon ou MultiPolygon
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 
 def _resolve_user_id(user_id: Optional[int]) -> int:
     return int(user_id) if user_id is not None else DEV_USER_ID
+
+
+def _assert_admin(uid: int) -> None:
+    if uid not in ADMIN_USER_IDS:
+        raise HTTPException(status_code=403, detail="Forbidden (admin only)")
 
 
 def _get_user_agency(cur, user_id: int) -> int:
@@ -86,15 +108,22 @@ def _get_user_agency(cur, user_id: int) -> int:
     return row[0]
 
 
-def _user_has_territory(cur, user_id: int) -> bool:
-    cur.execute("SELECT 1 FROM user_territories WHERE user_id = %s LIMIT 1;", (user_id,))
+def _user_has_territory(cur, user_id: int, agency_id: int) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM user_territories
+        WHERE user_id = %s AND agency_id = %s
+        LIMIT 1;
+        """,
+        (user_id, agency_id),
+    )
     return cur.fetchone() is not None
 
 
 def _get_primary_agency_zone(cur, agency_id: int) -> Optional[int]:
     """
     MVP: une agence (BU) a 1+ zones; on prend la première.
-    Plus tard: agence peut en avoir plusieurs + UI manager.
     """
     cur.execute(
         """
@@ -127,6 +156,17 @@ def _get_zone_geojson(cur, zone_id: int) -> Tuple[int, str, str]:
     return row[0], row[1], row[2]
 
 
+def _validate_geojson(obj: Dict[str, Any]) -> None:
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=400, detail="geojson invalide (object attendu)")
+    t = obj.get("type")
+    if t not in ("Polygon", "MultiPolygon"):
+        raise HTTPException(status_code=400, detail="geojson doit être Polygon ou MultiPolygon")
+    coords = obj.get("coordinates")
+    if not isinstance(coords, list) or len(coords) == 0:
+        raise HTTPException(status_code=400, detail="geojson.coordinates invalide")
+
+
 # -----------------------------------------------------------------------------
 # Healthcheck
 # -----------------------------------------------------------------------------
@@ -137,7 +177,7 @@ def read_root():
 
 
 # -----------------------------------------------------------------------------
-# Zone effective (celle de la BU de l'agent)
+# Zone effective (BU-zone) + has_territory
 # -----------------------------------------------------------------------------
 
 @app.get("/me/zone")
@@ -147,14 +187,182 @@ def get_my_zone(user_id: Optional[int] = Query(default=None)):
     with get_db() as conn:
         with conn.cursor() as cur:
             agency_id = _get_user_agency(cur, uid)
+            has_territory = _user_has_territory(cur, uid, agency_id)
+
             zone_id = _get_primary_agency_zone(cur, agency_id)
             if zone_id is None:
-                # Pas de BU-zone = pas de data
-                return {"item": None}
+                return {"item": None, "has_territory": has_territory}
 
             zid, name, geojson = _get_zone_geojson(cur, zone_id)
 
-    return {"item": {"id": zid, "name": name, "geojson": geojson}}
+    return {"item": {"id": zid, "name": name, "geojson": geojson}, "has_territory": has_territory}
+
+
+# -----------------------------------------------------------------------------
+# ADMIN (MVP brutal) - create users + assign micro-zones
+# -----------------------------------------------------------------------------
+
+@app.post("/admin/users")
+def admin_create_user(payload: AdminUserCreate, admin_user_id: Optional[int] = Query(default=None)):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name requis")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (agency_id, name, min_surface_m2, max_surface_m2)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, agency_id, name, min_surface_m2, max_surface_m2;
+                """,
+                (payload.agency_id, name, payload.min_surface_m2, payload.max_surface_m2),
+            )
+            row = cur.fetchone()
+        conn.commit()
+
+    return {
+        "item": {
+            "id": row[0],
+            "agency_id": row[1],
+            "name": row[2],
+            "min_surface_m2": float(row[3]) if row[3] is not None else None,
+            "max_surface_m2": float(row[4]) if row[4] is not None else None,
+        }
+    }
+
+
+@app.get("/admin/users")
+def admin_list_users(agency_id: int, admin_user_id: Optional[int] = Query(default=None)):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  u.id,
+                  u.agency_id,
+                  u.name,
+                  u.min_surface_m2,
+                  u.max_surface_m2,
+                  EXISTS (
+                    SELECT 1 FROM user_territories ut
+                    WHERE ut.user_id = u.id AND ut.agency_id = u.agency_id
+                  ) AS has_territory
+                FROM users u
+                WHERE u.agency_id = %s
+                ORDER BY u.id ASC;
+                """,
+                (agency_id,),
+            )
+            rows = cur.fetchall()
+
+    return {
+        "items": [
+            {
+                "id": r[0],
+                "agency_id": r[1],
+                "name": r[2],
+                "min_surface_m2": float(r[3]) if r[3] is not None else None,
+                "max_surface_m2": float(r[4]) if r[4] is not None else None,
+                "has_territory": bool(r[5]),
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/admin/users/{user_id}/territory")
+def admin_get_user_territory(user_id: int, admin_user_id: Optional[int] = Query(default=None)):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # récupère la micro-zone la plus récente (au cas où)
+            cur.execute(
+                """
+                SELECT name, ST_AsGeoJSON(geom)
+                FROM user_territories
+                WHERE user_id = %s
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+    if not row or row[1] is None:
+        return {"item": None}
+
+    return {"item": {"name": row[0], "geojson": row[1]}}
+
+
+@app.post("/admin/users/{user_id}/territory")
+def admin_upsert_user_territory(
+    user_id: int,
+    payload: AdminTerritoryUpsert,
+    admin_user_id: Optional[int] = Query(default=None),
+):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    tname = payload.name.strip()
+    if not tname:
+        raise HTTPException(status_code=400, detail="name requis pour la micro-zone")
+
+    _validate_geojson(payload.geojson)
+    geojson_str = json.dumps(payload.geojson)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # user + agency
+            cur.execute("SELECT agency_id FROM users WHERE id = %s;", (user_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="User inconnu")
+            agency_id = row[0]
+
+            # 1 micro-zone par user (MVP) => overwrite
+            cur.execute("DELETE FROM user_territories WHERE user_id = %s AND agency_id = %s;", (user_id, agency_id))
+
+            # Stockage en MultiPolygon(4326), quoi qu'il arrive (Polygon ou MultiPolygon)
+            cur.execute(
+                """
+                INSERT INTO user_territories (user_id, agency_id, name, geom)
+                VALUES (
+                  %s,
+                  %s,
+                  %s,
+                  ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326))
+                )
+                RETURNING id;
+                """,
+                (user_id, agency_id, tname, geojson_str),
+            )
+            _ = cur.fetchone()
+        conn.commit()
+
+    return {"success": True}
+
+
+@app.delete("/admin/users/{user_id}/territory")
+def admin_delete_user_territory(user_id: int, admin_user_id: Optional[int] = Query(default=None)):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # delete pour toutes agencies si jamais
+            cur.execute("DELETE FROM user_territories WHERE user_id = %s;", (user_id,))
+        conn.commit()
+
+    return {"success": True}
 
 
 # -----------------------------------------------------------------------------
@@ -169,15 +377,13 @@ def get_dpe(user_id: Optional[int] = Query(default=None)):
         with conn.cursor() as cur:
             agency_id = _get_user_agency(cur, uid)
 
-            # Décision produit: sans micro-zone => ne voit rien
-            if not _user_has_territory(cur, uid):
+            if not _user_has_territory(cur, uid, agency_id):
                 return {"items": []}
 
             zone_id = _get_primary_agency_zone(cur, agency_id)
             if zone_id is None:
                 return {"items": []}
 
-            # Projection visible = zone BU ∩ micro-zone user ∩ overlay BU ∩ filtre surface user
             cur.execute(
                 """
                 SELECT
@@ -199,13 +405,14 @@ def get_dpe(user_id: Optional[int] = Query(default=None)):
                     SELECT 1
                     FROM user_territories ut
                     WHERE ut.user_id = %s
+                      AND ut.agency_id = %s
                       AND ST_Intersects(ut.geom, t.geom)
                   )
                   AND (u.min_surface_m2 IS NULL OR t.surface_m2 >= u.min_surface_m2)
                   AND (u.max_surface_m2 IS NULL OR t.surface_m2 <= u.max_surface_m2)
                 ORDER BY t.id;
                 """,
-                (zone_id, uid, agency_id, uid),
+                (zone_id, uid, agency_id, uid, agency_id),
             )
             rows = cur.fetchall()
 
@@ -249,7 +456,6 @@ def update_dpe_status(
         with conn.cursor() as cur:
             agency_id = _get_user_agency(cur, uid)
 
-            # update overlay BU-shared, pas dpe_targets
             cur.execute(
                 """
                 UPDATE agency_targets
@@ -269,7 +475,7 @@ def update_dpe_status(
 
 
 # -----------------------------------------------------------------------------
-# Auto tour (MVP) - overlay BU + micro-zone + segmentation surface
+# Auto tour (MVP)
 # -----------------------------------------------------------------------------
 
 @app.post("/route/auto")
@@ -280,7 +486,7 @@ def route_auto(payload: AutoRouteRequest):
         with conn.cursor() as cur:
             agency_id = _get_user_agency(cur, uid)
 
-            if not _user_has_territory(cur, uid):
+            if not _user_has_territory(cur, uid, agency_id):
                 return {"target_ids_ordered": [], "polyline": None}
 
             zone_id = _get_primary_agency_zone(cur, agency_id)
@@ -301,6 +507,7 @@ def route_auto(payload: AutoRouteRequest):
                     SELECT 1
                     FROM user_territories ut
                     WHERE ut.user_id = %s
+                      AND ut.agency_id = %s
                       AND ST_Intersects(ut.geom, t.geom)
                   )
                   AND (u.min_surface_m2 IS NULL OR t.surface_m2 >= u.min_surface_m2)
@@ -308,7 +515,7 @@ def route_auto(payload: AutoRouteRequest):
                 ORDER BY t.id DESC
                 LIMIT %s;
                 """,
-                (zone_id, uid, agency_id, uid, POOL_MAX),
+                (zone_id, uid, agency_id, uid, agency_id, POOL_MAX),
             )
             rows = cur.fetchall()
 

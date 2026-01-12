@@ -9,12 +9,14 @@
  * ─────────────────────────────────────────────────────────────
  */
 
-
-
 "use client";
 
 import { useMemo, useState } from "react";
 import type { Target } from "../types";
+
+type EmptyState =
+  | { kind: "no_territory"; message: string }
+  | { kind: "job_done"; message: string };
 
 type Props = {
   activeTargets: Target[];
@@ -39,8 +41,10 @@ type Props = {
   onFocusTarget: (id: number) => void;
   focusedTargetId?: number | null;
 
-  // ✅ NEW: hover list -> highlight map
   onHoverTarget?: (id: number | null) => void;
+
+  // ✅ NEW
+  emptyState?: EmptyState | null;
 };
 
 export default function TargetList({
@@ -61,6 +65,7 @@ export default function TargetList({
   onFocusTarget,
   focusedTargetId = null,
   onHoverTarget,
+  emptyState = null,
 }: Props) {
   const safeTourIds = Array.isArray(tourIds) ? tourIds : [];
   const safeActive = Array.isArray(activeTargets) ? activeTargets : [];
@@ -72,7 +77,6 @@ export default function TargetList({
   const tourSet = new Set(safeTourIds);
   const tourIndex = new Map<number, number>(safeTourIds.map((id, i) => [id, i + 1]));
 
-  // SEARCH
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
 
@@ -87,7 +91,6 @@ export default function TargetList({
   const filteredInactive = useMemo(() => safeInactive.filter(matches), [safeInactive, q]);
   const isFiltering = q.length > 0;
 
-  // TOP BUTTON FEEDBACK
   const [copied, setCopied] = useState(false);
   const [opened, setOpened] = useState(false);
 
@@ -115,10 +118,9 @@ export default function TargetList({
   const topBtnDisabled = "bg-gray-700/60 text-white/50";
   const topBtnEnabled = "bg-blue-600 hover:bg-blue-700";
 
-  // ✅ list highlight: darker grey
   const itemBase = "border p-3 rounded cursor-pointer transition";
-  const itemFocused = "ring-2 ring-blue-400 bg-gray-200"; // ✅ plus visible
-  const itemHover = "hover:bg-gray-100"; // ✅ gris léger au hover
+  const itemFocused = "ring-2 ring-blue-400 bg-gray-200";
+  const itemHover = "hover:bg-gray-100";
 
   const attachHoverHandlers = (id: number) => ({
     onMouseEnter: () => onHoverTarget?.(id),
@@ -127,7 +129,6 @@ export default function TargetList({
 
   return (
     <section className="space-y-6">
-      {/* Actifs */}
       <div>
         <div className="flex items-center justify-between mb-3 gap-4">
           <h2 className="text-2xl font-semibold whitespace-nowrap">Targets actifs</h2>
@@ -189,7 +190,7 @@ export default function TargetList({
         </div>
 
         {safeActive.length === 0 ? (
-          <div className="text-gray-500">Job’s done ✅</div>
+          <div className="text-gray-500">{emptyState?.message ?? "Job’s done ✅"}</div>
         ) : filteredActive.length === 0 ? (
           <div className="text-gray-500">Aucun résultat{isFiltering ? ` pour “${query.trim()}”` : ""}.</div>
         ) : (
@@ -203,7 +204,7 @@ export default function TargetList({
               return (
                 <li
                   key={t.id}
-                  {...attachHoverHandlers(t.id)} // ✅ hover -> map
+                  {...attachHoverHandlers(t.id)}
                   onClick={() => onFocusTarget(t.id)}
                   className={[itemBase, isFocused ? itemFocused : itemHover].join(" ")}
                   title="Centrer sur la carte"
@@ -301,7 +302,6 @@ export default function TargetList({
         )}
       </div>
 
-      {/* Inactifs */}
       <details className="border rounded">
         <summary className="cursor-pointer select-none px-4 py-3 font-semibold">
           Inactifs ({filteredInactive.length}/{safeInactive.length})
@@ -320,7 +320,7 @@ export default function TargetList({
                 return (
                   <li
                     key={t.id}
-                    {...attachHoverHandlers(t.id)} // ✅ hover -> map
+                    {...attachHoverHandlers(t.id)}
                     onClick={() => onFocusTarget(t.id)}
                     className={[itemBase, isFocused ? itemFocused : itemHover].join(" ")}
                     title="Centrer sur la carte"

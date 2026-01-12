@@ -9,27 +9,24 @@
  * ─────────────────────────────────────────────────────────────
  */
 
-"use client";
+'use client';
 
-import { useEffect, useMemo, useState } from "react";
-import type { GeoJsonObject } from "geojson";
+import type { GeoJsonObject } from 'geojson';
+import { useEffect, useMemo, useState } from 'react';
 
-import type { Note, Target } from "../types";
-import TargetList from "../components/TargetList";
-import MapView from "../components/MapView";
-import NotesPanel from "../components/NotesPanel";
+import MapView from '../../app/components/MapView';
+import NotesPanel from '../../app/components/NotesPanel';
+import TargetList from '../../app/components/TargetList';
+import type { Note, Target } from '../../app/types';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
-// -----------------------------------------------------------------------------
-// MVP no-auth: on simule un user connecté
-// (plus tard: vient du token / session)
-// -----------------------------------------------------------------------------
-const DEV_USER_ID = 4;
+// MVP no-auth
+const DEV_USER_ID = 1;
 
 const TOUR_MAX = 8;
 const TOUR_STORAGE_KEY = (userId: number, zoneId: number | null) =>
-  `prospector:tour:u:${userId}:z:${zoneId ?? "none"}`;
+  `prospector:tour:u:${userId}:z:${zoneId ?? 'none'}`;
 
 function normalizeTourIds(raw: unknown, allTargets: Target[], max = TOUR_MAX): number[] {
   if (!Array.isArray(raw)) return [];
@@ -38,10 +35,10 @@ function normalizeTourIds(raw: unknown, allTargets: Target[], max = TOUR_MAX): n
   const cleaned: number[] = [];
 
   for (const x of raw) {
-    if (typeof x !== "number") continue;
+    if (typeof x !== 'number') continue;
     const t = byId.get(x);
     if (!t) continue;
-    if (t.status !== "non_traite") continue; // tournée = actionnables only
+    if (t.status !== 'non_traite') continue; // tournée = actionnables only
     if (cleaned.includes(x)) continue;
     cleaned.push(x);
     if (cleaned.length >= max) break;
@@ -50,67 +47,52 @@ function normalizeTourIds(raw: unknown, allTargets: Target[], max = TOUR_MAX): n
 }
 
 export default function ProspectionPage() {
-  // --- Core state ---
   const [targets, setTargets] = useState<Target[]>([]);
 
-  // --- "effective zone" (BU-zone) ---
   const [zoneId, setZoneId] = useState<number | null>(null);
-  const [zoneName, setZoneName] = useState<string>("");
+  const [zoneName, setZoneName] = useState<string>('');
   const [zoneGeoJson, setZoneGeoJson] = useState<GeoJsonObject | null>(null);
 
-  // --- Notes state ---
+  // ✅ NEW: distinguish “job done” vs “no territory”
+  const [hasTerritory, setHasTerritory] = useState<boolean | null>(null);
+
   const [selectedAddress, setSelectedAddress] = useState<string | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
-  const [noteContent, setNoteContent] = useState("");
+  const [noteContent, setNoteContent] = useState('');
   const [notePinned, setNotePinned] = useState(false);
 
-  // --- Tour state (single source of truth: tourIds) ---
   const [tourIds, setTourIds] = useState<number[]>([]);
   const [tourLoading, setTourLoading] = useState(false);
-
-  // ✅ prevents overwriting localStorage with [] before restore finishes
   const [tourHydrated, setTourHydrated] = useState(false);
 
-  // ✅ Focus + Hover
-  const [focusedTargetId, setFocusedTargetId] = useState<number | null>(null); // persist
-  const [hoveredTargetId, setHoveredTargetId] = useState<number | null>(null); // transient
+  const [focusedTargetId, setFocusedTargetId] = useState<number | null>(null);
+  const [hoveredTargetId, setHoveredTargetId] = useState<number | null>(null);
   const highlightedTargetId = hoveredTargetId ?? focusedTargetId;
 
-  // ---------------------------------------------------------------------------
-  // Status rules (MVP)
-  // ---------------------------------------------------------------------------
   const isRepasserDue = (t: Target) =>
-    t.status === "done_repasser" &&
+    t.status === 'done_repasser' &&
     !!t.next_action_at &&
     new Date(t.next_action_at).getTime() <= Date.now();
 
-  // ✅ Actifs = non_traite + done_repasser (dû)
   const activeTargets = useMemo(
-    () => targets.filter((t) => t.status === "non_traite" || isRepasserDue(t)),
-    [targets]
+    () => targets.filter((t) => t.status === 'non_traite' || isRepasserDue(t)),
+    [targets],
   );
 
-  // ✅ Inactifs = done / ignore / done_repasser (pas encore dû)
   const inactiveTargets = useMemo(
     () =>
       targets.filter((t) => {
-        if (t.status === "done" || t.status === "ignore") return true;
-        if (t.status === "done_repasser" && !isRepasserDue(t)) return true;
+        if (t.status === 'done' || t.status === 'ignore') return true;
+        if (t.status === 'done_repasser' && !isRepasserDue(t)) return true;
         return false;
       }),
-    [targets]
+    [targets],
   );
 
-  // ✅ Carte = seulement non_traite (actionnables)
   const actionableTargetsForMap = useMemo(
-    () => targets.filter((t) => t.status === "non_traite"),
-    [targets]
+    () => targets.filter((t) => t.status === 'non_traite'),
+    [targets],
   );
-
-  // ---------------------------------------------------------------------------
-  // Tour helpers
-  // ---------------------------------------------------------------------------
-  const isTourEligible = (t: Target) => t.status === "non_traite";
 
   const distance2 = (a: Target, b: Target) => {
     const dx = a.longitude - b.longitude;
@@ -125,11 +107,11 @@ export default function ProspectionPage() {
     for (const id of ids) {
       const t = targets.find((x) => x.id === id);
       if (!t) continue;
-      coords.push([t.longitude, t.latitude]); // GeoJSON = [lng, lat]
+      coords.push([t.longitude, t.latitude]);
     }
     if (coords.length < 2) return null;
 
-    return { type: "LineString", coordinates: coords } as unknown as GeoJsonObject;
+    return { type: 'LineString', coordinates: coords } as unknown as GeoJsonObject;
   };
 
   const tourPolyline = useMemo(() => toLineString(tourIds), [tourIds, targets]);
@@ -146,7 +128,7 @@ export default function ProspectionPage() {
       if (prev.length >= TOUR_MAX) return prev;
 
       const tNew = targets.find((x) => x.id === id);
-      if (!tNew || !isTourEligible(tNew)) return prev;
+      if (!tNew || tNew.status !== 'non_traite') return prev;
 
       if (prev.length === 0) return [id];
 
@@ -161,14 +143,12 @@ export default function ProspectionPage() {
       let bestIdx = 0;
       let bestDelta = Number.POSITIVE_INFINITY;
 
-      // beginning
       {
         const delta = distance2(tNew, tourTargets[0]);
         bestDelta = delta;
         bestIdx = 0;
       }
 
-      // middle
       for (let i = 0; i < tourTargets.length - 1; i++) {
         const A = tourTargets[i];
         const B = tourTargets[i + 1];
@@ -179,7 +159,6 @@ export default function ProspectionPage() {
         }
       }
 
-      // end
       {
         const A = tourTargets[tourTargets.length - 1];
         const delta = distance2(A, tNew);
@@ -193,17 +172,12 @@ export default function ProspectionPage() {
     });
   };
 
-  // ---------------------------------------------------------------------------
-  // Auto tour (backend = suggestion) + reset
-  // ---------------------------------------------------------------------------
   const startAutoTour = async () => {
     if (tourIds.length > 0) {
       setTourHydrated(true);
       try {
         localStorage.removeItem(TOUR_STORAGE_KEY(DEV_USER_ID, zoneId));
-      } catch {
-        // ignore
-      }
+      } catch {}
       setTourIds([]);
       return;
     }
@@ -212,13 +186,13 @@ export default function ProspectionPage() {
       setTourLoading(true);
 
       const res = await fetch(`${API_BASE}/route/auto`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: DEV_USER_ID }),
       });
 
       if (!res.ok) {
-        alert("Impossible de générer une tournée automatique.");
+        alert('Impossible de générer une tournée automatique.');
         return;
       }
 
@@ -228,23 +202,20 @@ export default function ProspectionPage() {
       const normalized = normalizeTourIds(rawIds, targets, TOUR_MAX);
 
       if (normalized.length === 0) {
-        alert("Impossible de générer une tournée automatique.");
+        alert('Impossible de générer une tournée automatique.');
         return;
       }
 
       setTourHydrated(true);
       setTourIds(normalized);
     } catch (e) {
-      console.error("POST /route/auto failed", e);
-      alert("Impossible de générer une tournée automatique.");
+      console.error('POST /route/auto failed', e);
+      alert('Impossible de générer une tournée automatique.');
     } finally {
       setTourLoading(false);
     }
   };
 
-  // ---------------------------------------------------------------------------
-  // Google Maps url (no API)
-  // ---------------------------------------------------------------------------
   const buildGoogleMapsUrl = (ids: number[], allTargets: Target[]): string | null => {
     if (!Array.isArray(ids) || ids.length === 0) return null;
 
@@ -254,7 +225,7 @@ export default function ProspectionPage() {
     for (const id of ids) {
       const t = byId.get(id);
       if (!t) continue;
-      if (typeof t.latitude !== "number" || typeof t.longitude !== "number") continue;
+      if (typeof t.latitude !== 'number' || typeof t.longitude !== 'number') continue;
       pts.push(`${t.latitude},${t.longitude}`);
     }
 
@@ -274,22 +245,19 @@ export default function ProspectionPage() {
       `&destination=${encodeURIComponent(destination)}` +
       `&travelmode=walking`;
 
-    return mids.length > 0 ? `${base}&waypoints=${encodeURIComponent(mids.join("|"))}` : base;
+    return mids.length > 0 ? `${base}&waypoints=${encodeURIComponent(mids.join('|'))}` : base;
   };
 
   const googleMapsUrl = useMemo(() => buildGoogleMapsUrl(tourIds, targets), [tourIds, targets]);
 
   const openTourInGoogleMaps = () => {
     if (!googleMapsUrl) {
-      alert("Ajoute au moins 1 point dans la tournée.");
+      alert('Ajoute au moins 1 point dans la tournée.');
       return;
     }
-    window.open(googleMapsUrl, "_blank", "noopener,noreferrer");
+    window.open(googleMapsUrl, '_blank', 'noopener,noreferrer');
   };
 
-  // ---------------------------------------------------------------------------
-  // Tour ordering (active list tour-first)
-  // ---------------------------------------------------------------------------
   const tourSet = useMemo(() => new Set(tourIds), [tourIds]);
 
   const activeTargetsTourFirst = useMemo(() => {
@@ -306,15 +274,15 @@ export default function ProspectionPage() {
     return [...tourOrdered, ...rest];
   }, [activeTargets, tourIds, tourSet]);
 
-  // ---------------------------------------------------------------------------
-  // Load effective zone once (agent = 1 zone)
-  // ---------------------------------------------------------------------------
+  // ✅ Load effective zone + has_territory
   useEffect(() => {
     let cancelled = false;
 
     async function loadMyZone() {
       try {
-        const res = await fetch(`${API_BASE}/me/zone?user_id=${DEV_USER_ID}`, { cache: "no-store" });
+        const res = await fetch(`${API_BASE}/me/zone?user_id=${DEV_USER_ID}`, {
+          cache: 'no-store',
+        });
         if (!res.ok) return;
 
         const data = await res.json();
@@ -322,15 +290,17 @@ export default function ProspectionPage() {
 
         if (cancelled) return;
 
+        setHasTerritory(typeof data?.has_territory === 'boolean' ? data.has_territory : null);
+
         if (!item) {
           setZoneId(null);
-          setZoneName("");
+          setZoneName('');
           setZoneGeoJson(null);
           return;
         }
 
         setZoneId(item.id);
-        setZoneName(item.name ?? "");
+        setZoneName(item.name ?? '');
 
         if (item.geojson) {
           try {
@@ -343,7 +313,7 @@ export default function ProspectionPage() {
           setZoneGeoJson(null);
         }
       } catch (e) {
-        console.error("Fetch /me/zone failed", e);
+        console.error('Fetch /me/zone failed', e);
       }
     }
 
@@ -353,9 +323,6 @@ export default function ProspectionPage() {
     };
   }, []);
 
-  // ---------------------------------------------------------------------------
-  // Load targets when zone is known (or whenever you want refresh)
-  // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
 
@@ -367,7 +334,7 @@ export default function ProspectionPage() {
         setTargets([]);
         setTourHydrated(false);
 
-        const res = await fetch(`${API_BASE}/dpe?user_id=${DEV_USER_ID}`, { cache: "no-store" });
+        const res = await fetch(`${API_BASE}/dpe?user_id=${DEV_USER_ID}`, { cache: 'no-store' });
         if (!res.ok) return;
 
         const data = await res.json();
@@ -375,20 +342,16 @@ export default function ProspectionPage() {
 
         if (!cancelled) setTargets(items);
       } catch (e) {
-        console.error("Fetch /dpe failed", e);
+        console.error('Fetch /dpe failed', e);
       }
     }
 
-    // si pas de BU-zone => pas de data
     if (zoneId !== null) void loadTargets();
     return () => {
       cancelled = true;
     };
   }, [zoneId]);
 
-  // ---------------------------------------------------------------------------
-  // Restore tour once after targets are loaded
-  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (zoneId === null) return;
     if (targets.length === 0) return;
@@ -402,53 +365,48 @@ export default function ProspectionPage() {
         if (restored.length > 0) setTourIds(restored);
       }
     } catch {
-      // ignore
     } finally {
       setTourHydrated(true);
     }
   }, [zoneId, targets, tourHydrated]);
 
-  // ---------------------------------------------------------------------------
-  // Save tour only after hydration
-  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (zoneId === null) return;
     if (!tourHydrated) return;
 
     try {
       localStorage.setItem(TOUR_STORAGE_KEY(DEV_USER_ID, zoneId), JSON.stringify(tourIds));
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, [zoneId, tourIds, tourHydrated]);
 
-  // ---------------------------------------------------------------------------
-  // Status updates
-  // ---------------------------------------------------------------------------
-  const updateStatus = async (id: number, status: Target["status"], nextActionAt: string | null = null) => {
+  const updateStatus = async (
+    id: number,
+    status: Target['status'],
+    nextActionAt: string | null = null,
+  ) => {
     const body: Record<string, unknown> = { status };
-    if (status === "done_repasser") body.next_action_at = nextActionAt;
+    if (status === 'done_repasser') body.next_action_at = nextActionAt;
 
     const res = await fetch(`${API_BASE}/dpe/${id}/status?user_id=${DEV_USER_ID}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
 
     if (!res.ok) {
-      alert("Erreur backend : statut non mis à jour");
+      alert('Erreur backend : statut non mis à jour');
       return;
     }
 
     setTargets((prev) =>
       prev.map((t) =>
         t.id === id
-          ? { ...t, status, next_action_at: status === "done_repasser" ? nextActionAt : null }
-          : t
-      )
+          ? { ...t, status, next_action_at: status === 'done_repasser' ? nextActionAt : null }
+          : t,
+      ),
     );
 
-    if (status !== "non_traite") {
+    if (status !== 'non_traite') {
       removeFromTour(id);
       if (focusedTargetId === id) setFocusedTargetId(null);
       if (hoveredTargetId === id) setHoveredTargetId(null);
@@ -457,16 +415,13 @@ export default function ProspectionPage() {
 
   const repasserInDays = async (id: number, days: number) => {
     const next = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-    await updateStatus(id, "done_repasser", next);
+    await updateStatus(id, 'done_repasser', next);
   };
 
-  // ---------------------------------------------------------------------------
-  // Notes
-  // ---------------------------------------------------------------------------
   const loadNotes = async (address: string) => {
     const res = await fetch(
       `${API_BASE}/notes?address=${encodeURIComponent(address)}&user_id=${DEV_USER_ID}`,
-      { cache: "no-store" }
+      { cache: 'no-store' },
     );
     const data = await res.json();
     setNotes(data.items ?? []);
@@ -480,7 +435,7 @@ export default function ProspectionPage() {
   const closeNotes = () => {
     setSelectedAddress(null);
     setNotes([]);
-    setNoteContent("");
+    setNoteContent('');
     setNotePinned(false);
   };
 
@@ -491,8 +446,8 @@ export default function ProspectionPage() {
     if (!content) return;
 
     const res = await fetch(`${API_BASE}/notes`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         address: selectedAddress,
         content,
@@ -502,29 +457,36 @@ export default function ProspectionPage() {
     });
 
     if (!res.ok) {
-      alert("Erreur : note non enregistrée");
+      alert('Erreur : note non enregistrée');
       return;
     }
 
-    setNoteContent("");
+    setNoteContent('');
     setNotePinned(false);
     await loadNotes(selectedAddress);
   };
 
-  // ---------------------------------------------------------------------------
-  // UI
-  // ---------------------------------------------------------------------------
+  // ✅ Empty state message (decides if “Job’s done” is valid)
+  const emptyState =
+    zoneId !== null && targets.length === 0
+      ? hasTerritory === false
+        ? {
+            kind: 'no_territory' as const,
+            message: 'Aucune micro-zone attribuée — contacte l’admin.',
+          }
+        : { kind: 'job_done' as const, message: 'Job’s done ✅' }
+      : null;
+
   return (
     <main className="p-10 space-y-10">
       <header className="space-y-2">
         <h1 className="text-4xl font-bold">PROSPECTOR</h1>
         <div className="text-sm text-gray-600">
-          Zone BU : <span className="font-medium">{zoneName || "—"}</span>
+          Zone BU : <span className="font-medium">{zoneName || '—'}</span>
         </div>
       </header>
 
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-10 items-start">
-        {/* Colonne gauche: LISTE */}
         <div className="space-y-8">
           <TargetList
             activeTargets={activeTargetsTourFirst}
@@ -536,17 +498,18 @@ export default function ProspectionPage() {
             googleMapsUrl={googleMapsUrl}
             onAddToTour={addToTour}
             onRemoveFromTour={removeFromTour}
-            onDone={(id) => updateStatus(id, "done")}
+            onDone={(id) => updateStatus(id, 'done')}
             onRepasser={(id, days) => repasserInDays(id, days)}
-            onIgnore={(id) => updateStatus(id, "ignore")}
-            onReset={(id) => updateStatus(id, "non_traite")}
+            onIgnore={(id) => updateStatus(id, 'ignore')}
+            onReset={(id) => updateStatus(id, 'non_traite')}
             onOpenNotes={openAddressNotes}
             onFocusTarget={(id) => setFocusedTargetId(id)}
             focusedTargetId={highlightedTargetId}
+            onHoverTarget={setHoveredTargetId}
+            emptyState={emptyState}
           />
         </div>
 
-        {/* Colonne droite: CARTE + NOTES */}
         <div className="space-y-6">
           <div className="space-y-4">
             <h2 className="text-2xl font-semibold">Carte (orientation)</h2>
