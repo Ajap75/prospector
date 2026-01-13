@@ -9,16 +9,17 @@
  * ─────────────────────────────────────────────────────────────
  */
 
-
-
 "use client";
 
-import type { Icon, Map as LeafletMap, Marker as LeafletMarker } from "leaflet";
+import type { Icon, Marker as LeafletMarker } from "leaflet";
 import "leaflet/dist/leaflet.css";
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Target } from "../types";
 import type { GeoJsonObject } from "geojson";
+import type { Target } from "../types";
+
+// ✅ IMPORTANT: hooks must be statically imported
+import { useMap } from "react-leaflet";
 
 const MapContainer = dynamic(() => import("react-leaflet").then((m) => m.MapContainer), { ssr: false });
 const TileLayer = dynamic(() => import("react-leaflet").then((m) => m.TileLayer), { ssr: false });
@@ -40,18 +41,85 @@ type Props = {
   maxPins?: number;
   zoneGeoJson?: GeoJsonObject | null;
 
-  // ✅ focus persist (list click)
   focusedTargetId?: number | null;
-
-  // ✅ highlight (hover > focus)
   highlightedTargetId?: number | null;
 
-  // ✅ hover pin -> list highlight
   onHoverTarget?: (id: number | null) => void;
 };
 
 function isLineString(obj: GeoJsonObject | null): obj is GeoJsonObject {
   return !!obj && (obj as any).type === "LineString" && Array.isArray((obj as any).coordinates);
+}
+
+/**
+ * ✅ Viewport controller lives INSIDE MapContainer tree, so useMap works.
+ * It:
+ * - fits to BU zone
+ * - centers on focused target
+ */
+function ViewportController({
+  zoneGeoJson,
+  focusedTarget,
+  dbgSet,
+}: {
+  zoneGeoJson?: GeoJsonObject | null;
+  focusedTarget: Target | null;
+  dbgSet: (s: string | ((prev: string) => string)) => void;
+}) {
+  const map = useMap();
+
+  // Fit bounds to zone (once zone is known / changes)
+  useEffect(() => {
+    let cancelled = false;
+
+    async function fit() {
+      if (!zoneGeoJson) {
+        dbgSet("debug:zoneGeoJson=null");
+        return;
+      }
+
+      dbgSet(`debug:map=OK zone.type=${(zoneGeoJson as any)?.type ?? "?"}`);
+
+      const L = await import("leaflet");
+      const layer = L.geoJSON(zoneGeoJson as any);
+      const bounds = layer.getBounds();
+
+      if (!bounds || !bounds.isValid()) {
+        dbgSet("debug:bounds=INVALID");
+        return;
+      }
+
+      const sw = bounds.getSouthWest();
+      const ne = bounds.getNorthEast();
+      dbgSet(
+        `debug:bounds OK sw=${sw.lat.toFixed(5)},${sw.lng.toFixed(5)} ne=${ne.lat.toFixed(5)},${ne.lng.toFixed(5)}`
+      );
+
+      window.setTimeout(() => {
+        if (cancelled) return;
+        try {
+          map.invalidateSize(true);
+          map.fitBounds(bounds, { padding: [24, 24] });
+          dbgSet((prev) => `${prev} | fitBounds done (zoom=${map.getZoom()})`);
+        } catch {
+          dbgSet("debug:fitBounds threw");
+        }
+      }, 0);
+    }
+
+    void fit();
+    return () => {
+      cancelled = true;
+    };
+  }, [map, zoneGeoJson, dbgSet]);
+
+  // Focus handling
+  useEffect(() => {
+    if (!focusedTarget) return;
+    map.setView([focusedTarget.latitude, focusedTarget.longitude], Math.max(map.getZoom(), 16), { animate: true });
+  }, [map, focusedTarget]);
+
+  return null;
 }
 
 export default function MapView({
@@ -69,27 +137,23 @@ export default function MapView({
 }: Props) {
   const items = Array.isArray(targets) ? targets : [];
   const actionable = useMemo(() => items.filter((t) => t.status === "non_traite"), [items]);
-
   const tourSet = useMemo(() => new Set(tourIds ?? []), [tourIds]);
 
-  // marker refs for programmatic popup opening
   const markerRefs = useRef<Record<number, LeafletMarker | null>>({});
 
-  // Pins ordering: tour first, then others (dedup guaranteed), then capped
   const pins = useMemo(() => {
     const tourPins = actionable.filter((t) => tourSet.has(t.id));
-
-    // ✅ exclude tour ids from the rest to guarantee uniqueness
     const otherPins = actionable.filter((t) => !tourSet.has(t.id));
-
     return [...tourPins, ...otherPins].slice(0, maxPins);
   }, [actionable, tourSet, maxPins]);
 
-
   const hasData = pins.length > 0;
-  const center: [number, number] = hasData ? [pins[0].latitude, pins[0].longitude] : [48.8566, 2.3522];
 
-  const [map, setMap] = useState<LeafletMap | null>(null);
+  // fallback center: will be immediately overridden by fitBounds when zone exists
+  const fallbackCenter: [number, number] = [48.8566, 2.3522];
+
+  // debug overlay
+  const [dbg, setDbg] = useState<string>("debug:init");
 
   // Icons
   const [iconGrey, setIconGrey] = useState<Icon | undefined>(undefined);
@@ -117,7 +181,6 @@ export default function MapView({
         iconAnchor: [17, 56] as [number, number],
         shadowSize: [56, 56] as [number, number],
       };
-
 
       const grey = L.icon({
         iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-grey.png",
@@ -161,55 +224,14 @@ export default function MapView({
     };
   }, []);
 
-  // Fit bounds to zone
-  useEffect(() => {
-    let cancelled = false;
-
-    async function fitToZone() {
-      if (!map || !zoneGeoJson) return;
-
-      const L = await import("leaflet");
-      const layer = L.geoJSON(zoneGeoJson as any);
-      const bounds = layer.getBounds();
-
-      if (!cancelled && bounds.isValid()) {
-        map.fitBounds(bounds, { padding: [24, 24] });
-      }
-    }
-
-    void fitToZone();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [map, zoneGeoJson]);
-
-  // Focus: center + open popup (persist focus only)
-  useEffect(() => {
-    if (!map) return;
-    if (!focusedTargetId) return;
-
-    const t = pins.find((x) => x.id === focusedTargetId);
-    if (!t) return;
-
-    map.setView([t.latitude, t.longitude], Math.max(map.getZoom(), 16), { animate: true });
-
-    const m = markerRefs.current[focusedTargetId];
-    if (m) {
-      window.setTimeout(() => {
-        try {
-          m.openPopup();
-        } catch {
-          // ignore
-        }
-      }, 120);
-    }
-  }, [map, focusedTargetId, pins]);
+  const focusedTarget = useMemo(() => {
+    if (!focusedTargetId) return null;
+    return pins.find((p) => p.id === focusedTargetId) ?? null;
+  }, [focusedTargetId, pins]);
 
   // Polyline
   const tourLatLngs = useMemo(() => {
     if (!isLineString(tourPolyline)) return null;
-
     const coords = (tourPolyline as any).coordinates as [number, number][];
     const latlngs: [number, number][] = coords.map(([lng, lat]) => [lat, lng]);
     return latlngs.length >= 2 ? latlngs : null;
@@ -217,6 +239,14 @@ export default function MapView({
 
   return (
     <div className="w-full h-[600px] rounded-lg overflow-hidden border relative">
+      {/* Debug overlay */}
+      <div className="absolute bottom-3 left-3 z-[1000] bg-white/90 border rounded px-3 py-2 text-xs max-w-[520px]">
+        <div className="font-mono">{dbg}</div>
+        <div className="text-gray-600 mt-1">
+          pins={pins.length} zone={zoneGeoJson ? "yes" : "no"}
+        </div>
+      </div>
+
       <div className="absolute top-3 left-3 z-[1000] bg-white/90 border rounded px-3 py-2 text-sm space-y-1">
         {hasData ? (
           <>
@@ -232,8 +262,14 @@ export default function MapView({
         )}
       </div>
 
-      <MapContainer center={center} zoom={13} style={{ height: "100%", width: "100%" }} whenCreated={setMap}>
-        <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png" />
+      <MapContainer center={fallbackCenter} zoom={13} style={{ height: "100%", width: "100%" }}>
+        {/* ✅ viewport controlled here */}
+        <ViewportController zoneGeoJson={zoneGeoJson} focusedTarget={focusedTarget} dbgSet={setDbg} />
+
+        <TileLayer
+          attribution="&copy; OpenStreetMap"
+          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+        />
 
         {zoneGeoJson ? (
           <GeoJSON
@@ -245,15 +281,7 @@ export default function MapView({
           />
         ) : null}
 
-        {tourLatLngs ? (
-          <Polyline
-            positions={tourLatLngs}
-            pathOptions={{
-              weight: 4,
-              opacity: 0.9,
-            }}
-          />
-        ) : null}
+        {tourLatLngs ? <Polyline positions={tourLatLngs} pathOptions={{ weight: 4, opacity: 0.9 }} /> : null}
 
         {pins.map((t) => {
           const inTour = tourSet.has(t.id);

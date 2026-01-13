@@ -1,7 +1,7 @@
 /**
  * ─────────────────────────────────────────────────────────────
  * Project : prospector
- * File    : Admin.tsx
+ * File    : page.tsx (Admin)
  * Author  : Antoine Astruc
  * Email   : antoine@maisonastruc.fr
  * Created : 2026-01-12
@@ -21,8 +21,10 @@ const ADMIN_USER_ID = 1;
 
 type AdminUser = {
   id: number;
+  name: string; // ✅ RESTORED (sinon liste “vide”)
+  email: string | null;
   agency_id: number;
-  name: string;
+  role: string;
   min_surface_m2: number | null;
   max_surface_m2: number | null;
   has_territory: boolean;
@@ -39,12 +41,16 @@ export default function AdminPage() {
 
   // Create user form
   const [newName, setNewName] = useState("");
+  const [newEmail, setNewEmail] = useState("");
   const [newMin, setNewMin] = useState<string>("");
   const [newMax, setNewMax] = useState<string>("");
 
   // Users list
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null);
+
+  // ✅ shared hover between list <-> map
+  const [hoveredUserId, setHoveredUserId] = useState<number | null>(null);
 
   // BU Zone (for map context)
   const [zone, setZone] = useState<ZoneItem | null>(null);
@@ -110,6 +116,7 @@ export default function AdminPage() {
     const name = newName.trim();
     if (!name) return;
 
+    const email = newEmail.trim();
     const min = newMin.trim() === "" ? null : Number(newMin);
     const max = newMax.trim() === "" ? null : Number(newMax);
 
@@ -118,6 +125,7 @@ export default function AdminPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name,
+        email: email === "" ? null : email,
         agency_id: agencyId,
         min_surface_m2: Number.isFinite(min as any) ? min : null,
         max_surface_m2: Number.isFinite(max as any) ? max : null,
@@ -134,6 +142,7 @@ export default function AdminPage() {
     const createdId = data?.item?.id as number | undefined;
 
     setNewName("");
+    setNewEmail("");
     setNewMin("");
     setNewMax("");
 
@@ -164,14 +173,11 @@ export default function AdminPage() {
                 type="number"
                 className="border rounded px-3 py-2 w-32"
                 value={agencyId}
-                onChange={(e) => setAgencyId(Number(e.target.value))}
+                onChange={(e) => setAgencyId(Number(e.target.value) || 1)}
               />
               <button className="px-3 py-2 border rounded" onClick={loadUsers}>
                 Refresh
               </button>
-            </div>
-            <div className="text-xs text-gray-500">
-              MVP: tu peux gérer BU=1, puis plus tard on branchera une vraie sélection org/agency.
             </div>
           </div>
 
@@ -183,6 +189,12 @@ export default function AdminPage() {
               placeholder="Nom (ex: Jean Dupont)"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
+            />
+            <input
+              className="border rounded px-3 py-2 w-full"
+              placeholder="Email (optionnel MVP)"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
             />
             <div className="grid grid-cols-2 gap-3">
               <input
@@ -206,33 +218,47 @@ export default function AdminPage() {
           {/* Users list */}
           <div className="border rounded p-4 space-y-3">
             <div className="font-semibold">Users (BU {agencyId})</div>
+
             {users.length === 0 ? (
               <div className="text-sm text-gray-500">Aucun user.</div>
             ) : (
               <ul className="space-y-2">
                 {users.map((u) => {
                   const selected = u.id === selectedUserId;
+                  const hovered = u.id === hoveredUserId;
+
                   return (
                     <li
                       key={u.id}
                       onClick={() => setSelectedUserId(u.id)}
+                      onMouseEnter={() => setHoveredUserId(u.id)}
+                      onMouseLeave={() => setHoveredUserId(null)}
                       className={[
                         "border rounded p-3 cursor-pointer transition",
-                        selected ? "ring-2 ring-blue-400 bg-gray-100" : "hover:bg-gray-50",
+                        selected ? "ring-2 ring-blue-400 bg-gray-100" : hovered ? "bg-gray-50" : "hover:bg-gray-50",
                       ].join(" ")}
+                      title="Hover = highlight zone sur la carte, Click = sélectionner"
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div className="font-medium">
                           {u.name} <span className="text-xs text-gray-500 font-mono">#{u.id}</span>
                         </div>
+
                         {u.has_territory ? (
                           <span className="text-xs px-2 py-1 rounded bg-green-100 text-green-900">micro-zone ✅</span>
                         ) : (
                           <span className="text-xs px-2 py-1 rounded bg-amber-100 text-amber-900">micro-zone ❌</span>
                         )}
                       </div>
-                      <div className="text-xs text-gray-500 mt-1">
-                        surface: {u.min_surface_m2 ?? "—"} → {u.max_surface_m2 ?? "—"}
+
+                      <div className="text-xs text-gray-500 mt-1 space-y-1">
+                        <div>
+                          role: <span className="font-mono">{u.role}</span> ·{" "}
+                          {u.email ? <span className="font-mono">{u.email}</span> : "email: —"}
+                        </div>
+                        <div>
+                          surface: {u.min_surface_m2 ?? "—"} → {u.max_surface_m2 ?? "—"}
+                        </div>
                       </div>
                     </li>
                   );
@@ -251,14 +277,19 @@ export default function AdminPage() {
               <span className="font-mono">{selectedUser ? `${selectedUser.name} (#${selectedUser.id})` : "—"}</span>
             </div>
             <div className="text-xs text-gray-500">
-              Dessine un polygone multipoints (quartier par rues), puis “Save”.
+              Hover un agent ↔ highlight sur la carte. Clique sur une microzone ↔ sélectionne l’agent.
             </div>
           </div>
 
           <AdminMapDraw
             apiBase={API_BASE}
             adminUserId={ADMIN_USER_ID}
+            agencyId={agencyId}
+            users={users} // ✅ to show names in tooltips/popups
             selectedUserId={selectedUserId}
+            hoveredUserId={hoveredUserId}
+            onSelectUserId={setSelectedUserId}
+            onHoverUserId={setHoveredUserId}
             zoneGeoJsonString={zone?.geojson ?? null}
           />
         </div>
