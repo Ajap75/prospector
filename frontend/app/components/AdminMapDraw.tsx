@@ -1,14 +1,3 @@
-/**
- * ─────────────────────────────────────────────────────────────
- * Project : prospector
- * File    : AdminMapDraw.tsx
- * Author  : Antoine Astruc
- * Email   : antoine@maisonastruc.fr
- * Created : 2026-01-12
- * License : MIT
- * ─────────────────────────────────────────────────────────────
- */
-
 "use client";
 
 import "leaflet/dist/leaflet.css";
@@ -16,15 +5,27 @@ import "leaflet-draw/dist/leaflet.draw.css";
 
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { GeoJsonObject } from "geojson";
+import type { GeoJsonObject, Geometry } from "geojson";
+import type { Map as LeafletMap } from "leaflet";
 
+// ✅ react-leaflet components (dynamic for SSR safety)
 const MapContainer = dynamic(() => import("react-leaflet").then((m) => m.MapContainer), { ssr: false });
 const TileLayer = dynamic(() => import("react-leaflet").then((m) => m.TileLayer), { ssr: false });
 const GeoJSON = dynamic(() => import("react-leaflet").then((m) => m.GeoJSON), { ssr: false });
+const FeatureGroup = dynamic(() => import("react-leaflet").then((m) => m.FeatureGroup), { ssr: false });
+
+// ✅ react-leaflet-draw (dynamic too)
+const EditControl = dynamic(() => import("react-leaflet-draw").then((m) => m.EditControl), { ssr: false });
 
 type AdminUser = {
   id: number;
-  name: string;
+  agency_id: number;
+  name?: string | null;
+  email?: string | null;
+  role?: string | null;
+  min_surface_m2?: number | null;
+  max_surface_m2?: number | null;
+  has_territory?: boolean;
 };
 
 type TerritoryItem = {
@@ -32,26 +33,22 @@ type TerritoryItem = {
   user_id: number;
   agency_id: number;
   name: string;
-  geojson: string; // feature/geometry JSON string
+  geojson: GeoJsonObject;
 };
 
 type Props = {
   apiBase: string;
   adminUserId: number;
   agencyId: number;
-
   users: AdminUser[];
-
   selectedUserId: number | null;
   hoveredUserId: number | null;
-
-  onSelectUserId: (id: number | null) => void;
+  onSelectUserId: (id: number) => void;
   onHoverUserId: (id: number | null) => void;
-
-  zoneGeoJsonString: string | null; // BU zone geojson (string)
+  zoneGeoJsonString: string | null;
 };
 
-function safeParseGeoJson(str: string | null): GeoJsonObject | null {
+function safeParseGeoJsonString(str: string | null): GeoJsonObject | null {
   if (!str) return null;
   try {
     return JSON.parse(str) as GeoJsonObject;
@@ -60,64 +57,118 @@ function safeParseGeoJson(str: string | null): GeoJsonObject | null {
   }
 }
 
-function colorForUser(userId: number): string {
-  // deterministic palette (enough for 10-15 users easily)
-  const palette = [
-    "#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#0ea5e9",
-    "#f97316", "#059669", "#db2777", "#ca8a04", "#334155",
-    "#22c55e", "#ef4444", "#8b5cf6", "#06b6d4", "#f59e0b",
-  ];
-  return palette[Math.abs(userId) % palette.length];
+function normalizeTerritoryGeoJson(x: any): GeoJsonObject | null {
+  if (!x) return null;
+  if (typeof x === "string") {
+    try {
+      return JSON.parse(x) as GeoJsonObject;
+    } catch {
+      return null;
+    }
+  }
+  return x as GeoJsonObject;
 }
 
-export default function AdminMapDraw({
-  apiBase,
-  adminUserId,
-  agencyId,
-  users,
-  selectedUserId,
-  hoveredUserId,
-  onSelectUserId,
-  onHoverUserId,
-  zoneGeoJsonString,
-}: Props) {
-  const zoneGeoJson = useMemo(() => safeParseGeoJson(zoneGeoJsonString), [zoneGeoJsonString]);
+function firstGeometryFromFeatureGroupToGeoJSON(fc: any): Geometry | null {
+  // react-leaflet FeatureGroup -> L.FeatureGroup -> toGeoJSON()
+  // can be FeatureCollection or GeometryCollection-ish
+  if (!fc) return null;
 
-  const userNameById = useMemo(() => {
-    const m = new Map<number, string>();
-    for (const u of users ?? []) m.set(u.id, u.name);
+  const features = Array.isArray(fc.features) ? fc.features : [];
+  if (features.length === 0) return null;
+
+  // take first polygon/multipolygon in features
+  for (const f of features) {
+    const g = f?.geometry;
+    if (!g) continue;
+    if (g.type === "Polygon" || g.type === "MultiPolygon") return g as Geometry;
+  }
+  return null;
+}
+
+const PALETTE = [
+  "#2563eb",
+  "#16a34a",
+  "#dc2626",
+  "#7c3aed",
+  "#ea580c",
+  "#0d9488",
+  "#9333ea",
+  "#4b5563",
+  "#ca8a04",
+  "#0891b2",
+];
+
+function colorForUserId(userId: number): string {
+  return PALETTE[Math.abs(userId) % PALETTE.length];
+}
+
+export default function AdminMapDraw(props: Props) {
+  const {
+    apiBase,
+    adminUserId,
+    agencyId,
+    users,
+    selectedUserId,
+    hoveredUserId,
+    onSelectUserId,
+    onHoverUserId,
+    zoneGeoJsonString,
+  } = props;
+
+  const zoneGeoJson = useMemo(() => safeParseGeoJsonString(zoneGeoJsonString), [zoneGeoJsonString]);
+
+  const [map, setMap] = useState<LeafletMap | null>(null);
+  const [territories, setTerritories] = useState<TerritoryItem[]>([]);
+  const [statusMsg, setStatusMsg] = useState<string>("");
+
+  const canEdit = selectedUserId !== null;
+
+  // ✅ Leaflet FeatureGroup instance is stored here (set in onMounted)
+  const featureGroupRef = useRef<any>(null);
+
+  // user lookup
+  const userById = useMemo(() => {
+    const m = new Map<number, AdminUser>();
+    (users ?? []).forEach((u) => m.set(u.id, u));
     return m;
   }, [users]);
 
-  const [territories, setTerritories] = useState<TerritoryItem[]>([]);
-  const [drawReady, setDrawReady] = useState(false);
+  const labelForUserId = (uid: number) => {
+    const u = userById.get(uid);
+    const name = (u?.name ?? "").trim();
+    return name ? `${name} (#${uid})` : `User #${uid}`;
+  };
 
-  // Leaflet refs
-  const mapRef = useRef<any>(null);
-  const drawnGroupRef = useRef<any>(null);
-  const drawControlRef = useRef<any>(null);
-
-  // ---------------------------------------------------------------------------
-  // Load all territories for BU
-  // ---------------------------------------------------------------------------
   const loadAllTerritories = async () => {
-    if (!Number.isFinite(agencyId)) return;
+    const url =
+      `${apiBase}/admin/territories?admin_user_id=${adminUserId}` +
+      `&agency_id=${encodeURIComponent(String(agencyId))}`;
 
-    try {
-      const res = await fetch(
-        `${apiBase}/admin/territories?admin_user_id=${adminUserId}&agency_id=${agencyId}`,
-        { cache: "no-store" }
-      );
-      if (!res.ok) {
-        const txt = await res.text();
-        console.error("GET /admin/territories failed", txt);
-        return;
-      }
-      const data = await res.json();
-      setTerritories(data.items ?? []);
-    } catch (e) {
-      console.error("GET /admin/territories failed", e);
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) {
+      console.error("GET /admin/territories failed", await res.text());
+      return;
     }
+
+    const data = await res.json();
+    const items = Array.isArray(data?.items) ? data.items : [];
+
+    setTerritories(
+      items
+        .map((it: any) => {
+          const gj = normalizeTerritoryGeoJson(it.geojson);
+          if (!gj) return null;
+          return {
+            id: Number(it.id),
+            user_id: Number(it.user_id),
+            agency_id: Number(it.agency_id),
+            name: String(it.name ?? ""),
+            geojson: gj,
+          } as TerritoryItem;
+        })
+        .filter(Boolean) as TerritoryItem[]
+    );
   };
 
   useEffect(() => {
@@ -125,281 +176,223 @@ export default function AdminMapDraw({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agencyId]);
 
-  // ---------------------------------------------------------------------------
-  // Init draw control once (client only)
-  // ---------------------------------------------------------------------------
+  // Fit to BU zone
   useEffect(() => {
-    let cancelled = false;
+    if (!map || !zoneGeoJson) return;
 
-    async function initDraw() {
-      if (typeof window === "undefined") return;
-      if (!mapRef.current) return;
-
-      const L = await import("leaflet");
-      await import("leaflet-draw");
-
-      if (cancelled) return;
-
-      // FeatureGroup where the admin draws the selected user's zone
-      const drawnItems = new L.FeatureGroup();
-      drawnGroupRef.current = drawnItems;
-      mapRef.current.addLayer(drawnItems);
-
-      const drawControl = new (L.Control as any).Draw({
-        position: "topright",
-        draw: {
-          polygon: true,
-          polyline: false,
-          rectangle: false,
-          circle: false,
-          circlemarker: false,
-          marker: false,
-        },
-        edit: {
-          featureGroup: drawnItems,
-          remove: true,
-        },
-      });
-
-      drawControlRef.current = drawControl;
-      mapRef.current.addControl(drawControl);
-
-      // When a polygon is created, keep only the last one (MVP)
-      mapRef.current.on((L as any).Draw.Event.CREATED, (e: any) => {
-        const layer = e.layer;
-        drawnItems.clearLayers();
-        drawnItems.addLayer(layer);
-      });
-
-      setDrawReady(true);
-    }
-
-    void initDraw();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // ---------------------------------------------------------------------------
-  // Fit map to BU zone
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    let cancelled = false;
-
-    async function fitToZone() {
-      if (!mapRef.current) return;
-      if (!zoneGeoJson) return;
-
-      const L = await import("leaflet");
-      const layer = L.geoJSON(zoneGeoJson as any);
+    (async () => {
+      const leaflet = await import("leaflet");
+      const layer = leaflet.geoJSON(zoneGeoJson as any);
       const bounds = layer.getBounds();
+      if (bounds?.isValid?.()) map.fitBounds(bounds, { padding: [24, 24] });
+    })();
+  }, [map, zoneGeoJson]);
 
-      if (!cancelled && bounds.isValid()) {
-        mapRef.current.fitBounds(bounds, { padding: [24, 24] });
-      }
-    }
+  // Load selected user's territory into editable featureGroup
+  useEffect(() => {
+    const fg = featureGroupRef.current;
+    if (!fg) return;
 
-    void fitToZone();
-    return () => {
-      cancelled = true;
-    };
-  }, [zoneGeoJson]);
-
-  // ---------------------------------------------------------------------------
-  // Helpers: compute a map center fallback
-  // ---------------------------------------------------------------------------
-  const center: [number, number] = [48.8566, 2.3522];
-
-  // ---------------------------------------------------------------------------
-  // Save / Delete territory for selected user (optional: depends on your backend endpoints)
-  // ---------------------------------------------------------------------------
-  const saveTerritory = async () => {
-    if (!selectedUserId) {
-      alert("Sélectionne un user.");
-      return;
-    }
-    if (!drawnGroupRef.current) return;
-
-    const layers = drawnGroupRef.current.getLayers?.() ?? [];
-    if (layers.length === 0) {
-      alert("Dessine une micro-zone avant de sauvegarder.");
+    if (!canEdit) {
+      setStatusMsg("Sélectionne un agent pour activer la toolbar.");
+      try {
+        fg.clearLayers?.();
+      } catch {}
       return;
     }
 
-    const layer = layers[0];
-    const geojson = layer.toGeoJSON();
+    const uid = selectedUserId!;
+    const t = territories.find((x) => x.user_id === uid) ?? null;
 
     try {
-      const res = await fetch(
-        `${apiBase}/admin/users/${selectedUserId}/territory?admin_user_id=${adminUserId}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: `Microzone user ${selectedUserId}`,
-            geojson,
-          }),
-        }
-      );
+      fg.clearLayers?.();
+    } catch {}
 
-      if (!res.ok) {
-        const txt = await res.text();
-        alert(`Erreur save: ${txt}`);
-        return;
-      }
-
-      await loadAllTerritories();
-      alert("Micro-zone sauvegardée ✅");
-    } catch (e) {
-      console.error("saveTerritory failed", e);
-      alert("Erreur save: Failed to fetch");
+    if (!t) {
+      setStatusMsg("Aucune micro-zone existante. Dessine puis “Save”.");
+      return;
     }
+
+    (async () => {
+      const leaflet = await import("leaflet");
+      const gjLayer = leaflet.geoJSON(t.geojson as any);
+
+      gjLayer.eachLayer((layer: any) => {
+        fg.addLayer?.(layer);
+      });
+
+      const bounds = gjLayer.getBounds?.();
+      if (bounds?.isValid?.() && map) map.fitBounds(bounds, { padding: [36, 36] });
+
+      setStatusMsg("Micro-zone chargée. Tu peux éditer puis “Save”.");
+    })();
+  }, [canEdit, selectedUserId, territories, map]);
+
+  const saveTerritory = async () => {
+    if (!selectedUserId) return alert("Sélectionne un agent.");
+
+    const fg = featureGroupRef.current;
+    if (!fg) return alert("FeatureGroup non prêt.");
+
+    const fc = fg.toGeoJSON?.();
+    const geometry = firstGeometryFromFeatureGroupToGeoJSON(fc);
+
+    if (!geometry) return alert("Dessine un polygone avant de sauvegarder.");
+    if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") {
+      return alert("Seuls Polygon / MultiPolygon sont supportés.");
+    }
+
+    const payload = { name: `Microzone ${selectedUserId}`, geojson: geometry };
+
+    const res = await fetch(`${apiBase}/admin/users/${selectedUserId}/territory?admin_user_id=${adminUserId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) return alert(`Erreur save: ${await res.text()}`);
+
+    setStatusMsg("✅ Micro-zone sauvegardée.");
+    await loadAllTerritories();
   };
 
   const deleteTerritory = async () => {
-    if (!selectedUserId) {
-      alert("Sélectionne un user.");
-      return;
-    }
+    if (!selectedUserId) return alert("Sélectionne un agent.");
+    if (!confirm("Supprimer la micro-zone de cet agent ?")) return;
+
+    const res = await fetch(`${apiBase}/admin/users/${selectedUserId}/territory?admin_user_id=${adminUserId}`, {
+      method: "DELETE",
+    });
+
+    if (!res.ok) return alert(`Erreur delete: ${await res.text()}`);
 
     try {
-      const res = await fetch(
-        `${apiBase}/admin/users/${selectedUserId}/territory?admin_user_id=${adminUserId}`,
-        { method: "DELETE" }
-      );
+      featureGroupRef.current?.clearLayers?.();
+    } catch {}
 
-      if (!res.ok) {
-        const txt = await res.text();
-        alert(`Erreur delete: ${txt}`);
-        return;
-      }
-
-      if (drawnGroupRef.current) drawnGroupRef.current.clearLayers();
-      await loadAllTerritories();
-      alert("Micro-zone supprimée ✅");
-    } catch (e) {
-      console.error("deleteTerritory failed", e);
-      alert("Erreur delete: Failed to fetch");
-    }
+    setStatusMsg("🗑️ Micro-zone supprimée.");
+    await loadAllTerritories();
   };
 
-  // ---------------------------------------------------------------------------
-  // Render territories GeoJSON layers with events
-  // ---------------------------------------------------------------------------
-  const territoryLayers = useMemo(() => {
-    return territories
-      .map((t) => {
-        const gj = safeParseGeoJson(t.geojson);
-        if (!gj) return null;
-        return { ...t, parsed: gj };
-      })
-      .filter(Boolean) as Array<TerritoryItem & { parsed: GeoJsonObject }>;
-  }, [territories]);
+  const clearDraft = () => {
+    try {
+      featureGroupRef.current?.clearLayers?.();
+    } catch {}
+    setStatusMsg("Draft effacé. Dessine un nouveau polygone.");
+  };
+
+  // Territories style + hover
+  const effectiveHighlightedUserId = hoveredUserId ?? selectedUserId ?? null;
+
+  const territoryStyle = (uid: number) => {
+    const base = colorForUserId(uid);
+    const highlighted = effectiveHighlightedUserId === uid;
+    return {
+      color: base,
+      weight: highlighted ? 4 : 2,
+      opacity: highlighted ? 0.95 : 0.75,
+      fillColor: base,
+      fillOpacity: highlighted ? 0.22 : 0.12,
+    };
+  };
+
+  const defaultCenter: [number, number] = [48.8566, 2.3522];
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center gap-3">
-        <button
-          className="px-3 py-2 bg-blue-600 text-white rounded disabled:opacity-50"
-          onClick={saveTerritory}
-          disabled={!drawReady || !selectedUserId}
-          title={!selectedUserId ? "Sélectionne un user d’abord" : "Sauvegarder la microzone dessinée"}
-        >
-          Save micro-zone
-        </button>
+    <div className="w-full space-y-3">
+      <div className="flex items-center justify-between gap-4">
+        <div className="text-sm text-gray-600">{statusMsg || "—"}</div>
 
-        <button
-          className="px-3 py-2 border rounded disabled:opacity-50"
-          onClick={deleteTerritory}
-          disabled={!selectedUserId}
-          title={!selectedUserId ? "Sélectionne un user d’abord" : "Supprimer la microzone du user"}
-        >
-          Delete micro-zone
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className={
+              canEdit ? "px-3 py-2 bg-blue-600 text-white rounded" : "px-3 py-2 bg-gray-200 text-gray-500 rounded cursor-not-allowed"
+            }
+            onClick={saveTerritory}
+            disabled={!canEdit}
+          >
+            Save
+          </button>
 
-        <button className="px-3 py-2 border rounded" onClick={loadAllTerritories}>
-          Refresh micro-zones
-        </button>
+          <button
+            className={canEdit ? "px-3 py-2 border rounded hover:bg-gray-50" : "px-3 py-2 border rounded text-gray-400 cursor-not-allowed"}
+            onClick={clearDraft}
+            disabled={!canEdit}
+          >
+            Clear
+          </button>
 
-        <span className="text-sm text-gray-500">
-          BU {agencyId} · micro-zones: {territories.length}
-        </span>
+          <button
+            className={
+              canEdit ? "px-3 py-2 bg-red-600 text-white rounded" : "px-3 py-2 bg-gray-200 text-gray-500 rounded cursor-not-allowed"
+            }
+            onClick={deleteTerritory}
+            disabled={!canEdit}
+          >
+            Delete
+          </button>
+        </div>
       </div>
 
       <div className="w-full h-[650px] rounded-lg overflow-hidden border relative">
-        <MapContainer
-          center={center}
-          zoom={13}
-          style={{ height: "100%", width: "100%" }}
-          whenCreated={(m) => {
-            mapRef.current = m;
-          }}
-        >
-          <TileLayer
-            attribution="&copy; OpenStreetMap"
-            url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
-          />
+        {!canEdit ? (
+          <div className="absolute top-3 left-3 z-[1000] bg-white/90 border rounded px-3 py-2 text-sm">
+            Sélectionne un agent à gauche pour activer la toolbar.
+          </div>
+        ) : null}
 
-          {/* BU zone in background */}
-          {zoneGeoJson ? (
+        <MapContainer center={defaultCenter} zoom={13} style={{ height: "100%", width: "100%" }} whenCreated={setMap}>
+          <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png" />
+
+          {zoneGeoJson ? <GeoJSON data={zoneGeoJson} style={{ weight: 2, opacity: 0.85, fillOpacity: 0.05 } as any} /> : null}
+
+          {territories.map((t) => (
             <GeoJSON
-              data={zoneGeoJson}
-              style={{
-                weight: 2,
-                opacity: 0.8,
-                fillOpacity: 0.04,
+              key={t.id}
+              data={t.geojson}
+              style={territoryStyle(t.user_id) as any}
+              eventHandlers={{
+                mouseover: () => onHoverUserId(t.user_id),
+                mouseout: () => onHoverUserId(null),
+                click: () => onSelectUserId(t.user_id),
+              }}
+              onEachFeature={(_feature: any, layer: any) => {
+                layer.bindTooltip(labelForUserId(t.user_id), { sticky: true, direction: "top" });
               }}
             />
-          ) : null}
+          ))}
 
-          {/* All microzones */}
-          {territoryLayers.map((t) => {
-            const userId = t.user_id;
-            const baseColor = colorForUser(userId);
-
-            const isHovered = hoveredUserId === userId;
-            const isSelected = selectedUserId === userId;
-
-            const weight = isSelected ? 5 : isHovered ? 4 : 2;
-            const fillOpacity = isSelected ? 0.22 : isHovered ? 0.18 : 0.10;
-
-            return (
-              <GeoJSON
-                key={t.id}
-                data={t.parsed}
-                style={{
-                  color: baseColor,
-                  weight,
-                  opacity: 0.95,
-                  fillOpacity,
-                }}
-                eventHandlers={{
-                  mouseover: () => onHoverUserId(userId),
-                  mouseout: () => onHoverUserId(null),
-                  click: () => onSelectUserId(userId),
+          {/* ✅ Editable layer lives INSIDE react-leaflet tree */}
+          <FeatureGroup
+            ref={(ref: any) => {
+              // react-leaflet gives a wrapper; leaflet instance is `.leafletElement` in old versions,
+              // but in newer versions it’s usually ref.current itself being the L.FeatureGroup.
+              // We normalize by taking `ref` as-is.
+              featureGroupRef.current = ref;
+            }}
+          >
+            {canEdit ? (
+              <EditControl
+                position="topright"
+                onCreated={() => setStatusMsg("Polygone prêt. Clique “Save”.")}
+                onEdited={() => setStatusMsg("Polygone modifié. Clique “Save”.")}
+                onDeleted={() => setStatusMsg("Polygone supprimé. Dessine puis “Save”.")}
+                draw={{
+                  polygon: {
+                    allowIntersection: false,
+                    showArea: true,
+                    shapeOptions: { weight: 2, opacity: 0.9, fillOpacity: 0.12 },
+                  },
+                  polyline: false,
+                  rectangle: false,
+                  circle: false,
+                  circlemarker: false,
+                  marker: false,
                 }}
               />
-            );
-          })}
+            ) : null}
+          </FeatureGroup>
         </MapContainer>
-
-        {/* Small legend */}
-        <div className="absolute bottom-3 left-3 z-[1000] bg-white/90 border rounded px-3 py-2 text-xs space-y-1">
-          <div className="font-semibold">Legend</div>
-          <div>Hover une zone ↔ highlight user</div>
-          <div>Click une zone ↔ select user</div>
-          {selectedUserId ? (
-            <div className="text-gray-700">
-              Selected:{" "}
-              <span className="font-mono">
-                {userNameById.get(selectedUserId) ?? `#${selectedUserId}`}
-              </span>
-            </div>
-          ) : (
-            <div className="text-gray-400">Selected: —</div>
-          )}
-        </div>
       </div>
     </div>
   );
