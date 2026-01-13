@@ -30,14 +30,12 @@ app = FastAPI()
 # ✅ Keep ONE CORS middleware (your frontend calls backend from localhost:3000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -----------------------------------------------------------------------------
 # DEV CONTEXT (no-auth MVP)
@@ -53,6 +51,7 @@ POOL_MAX = 50
 # -----------------------------------------------------------------------------
 # Pydantic Models
 # -----------------------------------------------------------------------------
+
 
 class DpeStatusUpdate(BaseModel):
     status: str
@@ -74,11 +73,12 @@ class AutoRouteRequest(BaseModel):
 
 # --- Admin payloads (MVP brutal) ------------------------------------------------
 
+
 class AdminUserCreate(BaseModel):
     name: str
     agency_id: int
-    email: Optional[str] = None      # ✅ optionnel
-    role: str = "agent"              # ✅ default
+    email: Optional[str] = None  # ✅ optionnel
+    role: str = "agent"  # ✅ default
     min_surface_m2: Optional[float] = None
     max_surface_m2: Optional[float] = None
 
@@ -90,9 +90,15 @@ class AdminTerritoryUpsert(BaseModel):
     geojson: Dict[str, Any]
 
 
+class AdminZoneUpsert(BaseModel):
+    name: str
+    geojson: Dict[str, Any]
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
 
 def _resolve_user_id(user_id: Optional[int]) -> int:
     return int(user_id) if user_id is not None else DEV_USER_ID
@@ -112,7 +118,9 @@ def _get_user_agency(cur, user_id: int) -> int:
 
 
 def _user_has_territory(cur, user_id: int) -> bool:
-    cur.execute("SELECT 1 FROM user_territories WHERE user_id = %s LIMIT 1;", (user_id,))
+    cur.execute(
+        "SELECT 1 FROM user_territories WHERE user_id = %s LIMIT 1;", (user_id,)
+    )
     return cur.fetchone() is not None
 
 
@@ -157,7 +165,9 @@ def _validate_geojson_polygon(obj: Dict[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="geojson invalide (object attendu)")
     t = obj.get("type")
     if t not in ("Polygon", "MultiPolygon"):
-        raise HTTPException(status_code=400, detail="geojson doit être Polygon ou MultiPolygon")
+        raise HTTPException(
+            status_code=400, detail="geojson doit être Polygon ou MultiPolygon"
+        )
     coords = obj.get("coordinates")
     if not isinstance(coords, list) or len(coords) == 0:
         raise HTTPException(status_code=400, detail="geojson.coordinates invalide")
@@ -167,6 +177,7 @@ def _validate_geojson_polygon(obj: Dict[str, Any]) -> None:
 # Healthcheck
 # -----------------------------------------------------------------------------
 
+
 @app.get("/")
 def read_root():
     return {"message": "PROSPECTOR backend is running"}
@@ -175,6 +186,7 @@ def read_root():
 # -----------------------------------------------------------------------------
 # Zone effective (celle de la BU de l'agent) + has_territory
 # -----------------------------------------------------------------------------
+
 
 @app.get("/me/zone")
 def get_my_zone(user_id: Optional[int] = Query(default=None)):
@@ -191,15 +203,21 @@ def get_my_zone(user_id: Optional[int] = Query(default=None)):
 
             zid, name, geojson = _get_zone_geojson(cur, zone_id)
 
-    return {"item": {"id": zid, "name": name, "geojson": geojson}, "has_territory": has_territory}
+    return {
+        "item": {"id": zid, "name": name, "geojson": geojson},
+        "has_territory": has_territory,
+    }
 
 
 # -----------------------------------------------------------------------------
 # ADMIN (MVP brutal) - create users + assign micro-zones
 # -----------------------------------------------------------------------------
 
+
 @app.post("/admin/users")
-def admin_create_user(payload: AdminUserCreate, admin_user_id: Optional[int] = Query(default=None)):
+def admin_create_user(
+    payload: AdminUserCreate, admin_user_id: Optional[int] = Query(default=None)
+):
     admin_uid = _resolve_user_id(admin_user_id)
     _assert_admin(admin_uid)
 
@@ -219,7 +237,13 @@ def admin_create_user(payload: AdminUserCreate, admin_user_id: Optional[int] = Q
                 VALUES (%s, %s, %s, 'agent', %s, %s)
                 RETURNING id, agency_id, name, email, role, min_surface_m2, max_surface_m2;
                 """,
-                (payload.agency_id, name, email, payload.min_surface_m2, payload.max_surface_m2),
+                (
+                    payload.agency_id,
+                    name,
+                    email,
+                    payload.min_surface_m2,
+                    payload.max_surface_m2,
+                ),
             )
             row = cur.fetchone()
         conn.commit()
@@ -239,7 +263,9 @@ def admin_create_user(payload: AdminUserCreate, admin_user_id: Optional[int] = Q
 
 
 @app.get("/admin/users")
-def admin_list_users(admin_user_id: Optional[int] = Query(default=None), agency_id: int = Query(...)):
+def admin_list_users(
+    admin_user_id: Optional[int] = Query(default=None), agency_id: int = Query(...)
+):
     admin_uid = _resolve_user_id(admin_user_id)
     _assert_admin(admin_uid)
 
@@ -286,7 +312,9 @@ def admin_list_users(admin_user_id: Optional[int] = Query(default=None), agency_
 
 
 @app.get("/admin/users/{user_id}/territory")
-def admin_get_user_territory(user_id: int, admin_user_id: Optional[int] = Query(default=None)):
+def admin_get_user_territory(
+    user_id: int, admin_user_id: Optional[int] = Query(default=None)
+):
     admin_uid = _resolve_user_id(admin_user_id)
     _assert_admin(admin_uid)
 
@@ -363,7 +391,9 @@ def admin_upsert_user_territory(
 
 
 @app.delete("/admin/users/{user_id}/territory")
-def admin_delete_user_territory(user_id: int, admin_user_id: Optional[int] = Query(default=None)):
+def admin_delete_user_territory(
+    user_id: int, admin_user_id: Optional[int] = Query(default=None)
+):
     admin_uid = _resolve_user_id(admin_user_id)
     _assert_admin(admin_uid)
 
@@ -376,8 +406,140 @@ def admin_delete_user_territory(user_id: int, admin_user_id: Optional[int] = Que
 
 
 # -----------------------------------------------------------------------------
+# Admin - BU Zone (garde-fou) - 1 zone active par agency (MVP overwrite)
+# -----------------------------------------------------------------------------
+
+
+@app.get("/admin/zone")
+def admin_get_bu_zone(
+    admin_user_id: Optional[int] = Query(default=None),
+    agency_id: int = Query(...),
+):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            zone_id = _get_primary_agency_zone(cur, agency_id)
+            if zone_id is None:
+                return {"item": None}
+
+            zid, name, geojson = _get_zone_geojson(cur, zone_id)
+
+    return {"item": {"id": zid, "name": name, "geojson": geojson}}
+
+
+@app.post("/admin/zone")
+def admin_upsert_bu_zone(
+    payload: AdminZoneUpsert,
+    admin_user_id: Optional[int] = Query(default=None),
+    agency_id: int = Query(...),
+):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    _validate_geojson_polygon(payload.geojson)
+
+    zone_name = (payload.name or "").strip()
+    if not zone_name:
+        raise HTTPException(status_code=400, detail="name requis")
+
+    geo_str = json.dumps(payload.geojson)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # MVP: 1 zone active par agency => overwrite association
+            existing_zone_id = _get_primary_agency_zone(cur, agency_id)
+
+            if existing_zone_id is None:
+                # Create zone
+                cur.execute(
+                    """
+                    WITH g AS (
+                    SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)) AS geom
+                    )
+                    INSERT INTO zones (name, min_lat, max_lat, min_lng, max_lng, geom)
+                    SELECT
+                    %s,
+                    ST_YMin(geom) AS min_lat,
+                    ST_YMax(geom) AS max_lat,
+                    ST_XMin(geom) AS min_lng,
+                    ST_XMax(geom) AS max_lng,
+                    geom
+                    FROM g
+                    RETURNING id;
+                    """,
+                    (geo_str, zone_name),
+                )
+                zid = int(cur.fetchone()[0])
+
+                # Ensure single link for agency
+                cur.execute(
+                    "DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,)
+                )
+                cur.execute(
+                    "INSERT INTO agency_zones (agency_id, zone_id) VALUES (%s, %s);",
+                    (agency_id, zid),
+                )
+            else:
+                zid = int(existing_zone_id)
+                # Update zone geometry + name
+                cur.execute(
+                    """
+                        WITH g AS (
+                        SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)) AS geom
+                        )
+                        UPDATE zones z
+                        SET
+                        name = %s,
+                        geom = g.geom,
+                        min_lat = ST_YMin(g.geom),
+                        max_lat = ST_YMax(g.geom),
+                        min_lng = ST_XMin(g.geom),
+                        max_lng = ST_XMax(g.geom)
+                        FROM g
+                        WHERE z.id = %s;
+                        """,
+                    (geo_str, zone_name, zid),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Zone non trouvée")
+
+                # Ensure link exists (and unique)
+                cur.execute(
+                    "DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,)
+                )
+                cur.execute(
+                    "INSERT INTO agency_zones (agency_id, zone_id) VALUES (%s, %s);",
+                    (agency_id, zid),
+                )
+
+        conn.commit()
+
+    return {"success": True, "item": {"id": zid}}
+
+
+@app.delete("/admin/zone")
+def admin_delete_bu_zone(
+    admin_user_id: Optional[int] = Query(default=None),
+    agency_id: int = Query(...),
+):
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # remove association (non destructive for zones table)
+            cur.execute("DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,))
+        conn.commit()
+
+    return {"success": True}
+
+
+# -----------------------------------------------------------------------------
 # Admin - list micro-zones for a BU (agency)
 # -----------------------------------------------------------------------------
+
 
 @app.get("/admin/territories")
 def admin_list_territories(
@@ -423,6 +585,7 @@ def admin_list_territories(
 # -----------------------------------------------------------------------------
 # DPE Targets (BU-shared overlay + micro-zone mandatory + surface segmentation)
 # -----------------------------------------------------------------------------
+
 
 @app.get("/dpe")
 def get_dpe(user_id: Optional[int] = Query(default=None)):
@@ -502,7 +665,9 @@ def update_dpe_status(
         raise HTTPException(status_code=400, detail="Statut invalide")
 
     if new_status == "done_repasser" and payload.next_action_at is None:
-        raise HTTPException(status_code=400, detail="next_action_at requis pour done_repasser")
+        raise HTTPException(
+            status_code=400, detail="next_action_at requis pour done_repasser"
+        )
 
     next_action_at = payload.next_action_at if new_status == "done_repasser" else None
 
@@ -522,15 +687,23 @@ def update_dpe_status(
                 (new_status, next_action_at, agency_id, dpe_id),
             )
             if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Target absent de l'overlay agence")
+                raise HTTPException(
+                    status_code=404, detail="Target absent de l'overlay agence"
+                )
         conn.commit()
 
-    return {"success": True, "id": dpe_id, "status": new_status, "next_action_at": next_action_at}
+    return {
+        "success": True,
+        "id": dpe_id,
+        "status": new_status,
+        "next_action_at": next_action_at,
+    }
 
 
 # -----------------------------------------------------------------------------
 # Auto tour (MVP) - overlay BU + micro-zone + segmentation surface
 # -----------------------------------------------------------------------------
+
 
 @app.post("/route/auto")
 def route_auto(payload: AutoRouteRequest):
@@ -575,7 +748,11 @@ def route_auto(payload: AutoRouteRequest):
     if not rows:
         return {"target_ids_ordered": [], "polyline": None}
 
-    points = [{"id": r[0], "lat": r[1], "lng": r[2]} for r in rows if r[1] is not None and r[2] is not None]
+    points = [
+        {"id": r[0], "lat": r[1], "lng": r[2]}
+        for r in rows
+        if r[1] is not None and r[2] is not None
+    ]
     if not points:
         return {"target_ids_ordered": [], "polyline": None}
 
@@ -600,7 +777,9 @@ def route_auto(payload: AutoRouteRequest):
 
     ids = [p["id"] for p in ordered]
     coords = [[p["lng"], p["lat"]] for p in ordered]
-    polyline = {"type": "LineString", "coordinates": coords} if len(coords) >= 2 else None
+    polyline = (
+        {"type": "LineString", "coordinates": coords} if len(coords) >= 2 else None
+    )
 
     return {"target_ids_ordered": ids, "polyline": polyline}
 
@@ -608,6 +787,7 @@ def route_auto(payload: AutoRouteRequest):
 # -----------------------------------------------------------------------------
 # Notes (BU-shared)
 # -----------------------------------------------------------------------------
+
 
 @app.get("/notes")
 def list_notes(address: str, user_id: Optional[int] = Query(default=None)):
@@ -661,7 +841,14 @@ def create_note(payload: NoteCreate):
                 VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id, dpe_id, address, content, tags, pinned, created_at;
                 """,
-                (agency_id, payload.dpe_id, payload.address, content, payload.tags, payload.pinned),
+                (
+                    agency_id,
+                    payload.dpe_id,
+                    payload.address,
+                    content,
+                    payload.tags,
+                    payload.pinned,
+                ),
             )
             row = cur.fetchone()
         conn.commit()

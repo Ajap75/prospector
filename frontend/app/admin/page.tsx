@@ -21,7 +21,7 @@ const ADMIN_USER_ID = 1;
 
 type AdminUser = {
   id: number;
-  name: string; // ✅ RESTORED (sinon liste “vide”)
+  name: string;
   email: string | null;
   agency_id: number;
   role: string;
@@ -36,8 +36,13 @@ type ZoneItem = {
   geojson: string; // string JSON depuis backend
 };
 
+type MapMode = "territory" | "bu_zone";
+
 export default function AdminPage() {
   const [agencyId, setAgencyId] = useState<number>(1);
+
+  // ✅ NEW: map mode toggle
+  const [mapMode, setMapMode] = useState<MapMode>("territory");
 
   // Create user form
   const [newName, setNewName] = useState("");
@@ -52,7 +57,7 @@ export default function AdminPage() {
   // ✅ shared hover between list <-> map
   const [hoveredUserId, setHoveredUserId] = useState<number | null>(null);
 
-  // BU Zone (for map context)
+  // ✅ BU Zone (for map context + BU zone editor)
   const [zone, setZone] = useState<ZoneItem | null>(null);
 
   const selectedUser = useMemo(
@@ -61,32 +66,33 @@ export default function AdminPage() {
   );
 
   // ---------------------------------------------------------------------------
-  // Load BU zone (based on ADMIN user agency – OK for MVP)
+  // ✅ Load BU zone for selected agency (admin endpoint)
   // ---------------------------------------------------------------------------
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadZone() {
-      try {
-        const res = await fetch(`${API_BASE}/me/zone?user_id=${ADMIN_USER_ID}`, { cache: "no-store" });
-        const data = await res.json();
-        if (cancelled) return;
-
-        if (!data?.item) {
-          setZone(null);
-          return;
-        }
-        setZone(data.item as ZoneItem);
-      } catch {
+  const loadBuZone = async () => {
+    try {
+      const res = await fetch(
+        `${API_BASE}/admin/zone?agency_id=${agencyId}&admin_user_id=${ADMIN_USER_ID}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) {
         setZone(null);
+        return;
       }
+      const data = await res.json();
+      if (!data?.item) {
+        setZone(null);
+        return;
+      }
+      setZone(data.item as ZoneItem);
+    } catch {
+      setZone(null);
     }
+  };
 
-    void loadZone();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  useEffect(() => {
+    void loadBuZone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agencyId]);
 
   // ---------------------------------------------------------------------------
   // Load users
@@ -151,6 +157,19 @@ export default function AdminPage() {
   };
 
   // ---------------------------------------------------------------------------
+  // ✅ Mode-aware handlers (avoid confusion when editing BU zone)
+  // ---------------------------------------------------------------------------
+  const handleSelectUserId = (id: number) => {
+    if (mapMode === "bu_zone") return; // ignore selection in BU zone editor mode
+    setSelectedUserId(id);
+  };
+
+  const handleHoverUserId = (id: number | null) => {
+    if (mapMode === "bu_zone") return; // ignore hover in BU zone editor mode
+    setHoveredUserId(id);
+  };
+
+  // ---------------------------------------------------------------------------
   // UI
   // ---------------------------------------------------------------------------
   return (
@@ -175,7 +194,13 @@ export default function AdminPage() {
                 value={agencyId}
                 onChange={(e) => setAgencyId(Number(e.target.value) || 1)}
               />
-              <button className="px-3 py-2 border rounded" onClick={loadUsers}>
+              <button
+                className="px-3 py-2 border rounded"
+                onClick={async () => {
+                  await loadUsers();
+                  await loadBuZone();
+                }}
+              >
                 Refresh
               </button>
             </div>
@@ -230,14 +255,19 @@ export default function AdminPage() {
                   return (
                     <li
                       key={u.id}
-                      onClick={() => setSelectedUserId(u.id)}
-                      onMouseEnter={() => setHoveredUserId(u.id)}
-                      onMouseLeave={() => setHoveredUserId(null)}
+                      onClick={() => handleSelectUserId(u.id)}
+                      onMouseEnter={() => handleHoverUserId(u.id)}
+                      onMouseLeave={() => handleHoverUserId(null)}
                       className={[
                         "border rounded p-3 cursor-pointer transition",
                         selected ? "ring-2 ring-blue-400 bg-gray-100" : hovered ? "bg-gray-50" : "hover:bg-gray-50",
+                        mapMode === "bu_zone" ? "opacity-60 cursor-not-allowed" : "",
                       ].join(" ")}
-                      title="Hover = highlight zone sur la carte, Click = sélectionner"
+                      title={
+                        mapMode === "bu_zone"
+                          ? "Mode Zone BU actif : repasse en Micro-zones pour éditer un agent."
+                          : "Hover = highlight zone sur la carte, Click = sélectionner"
+                      }
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div className="font-medium">
@@ -270,27 +300,63 @@ export default function AdminPage() {
 
         {/* RIGHT: map + draw */}
         <div className="lg:col-span-2 space-y-4">
-          <div className="border rounded p-4 space-y-2">
-            <div className="font-semibold">Micro-zone editor</div>
-            <div className="text-sm text-gray-600">
-              User sélectionné :{" "}
-              <span className="font-mono">{selectedUser ? `${selectedUser.name} (#${selectedUser.id})` : "—"}</span>
+          {/* ✅ Mode switch + context */}
+          <div className="border rounded p-4 space-y-3">
+            <div className="flex items-center justify-between gap-4">
+              <div className="font-semibold">
+                {mapMode === "bu_zone" ? "Zone BU editor (garde-fou)" : "Micro-zone editor"}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  className={mapMode === "territory" ? "px-3 py-2 bg-black text-white rounded" : "px-3 py-2 border rounded"}
+                  onClick={() => setMapMode("territory")}
+                >
+                  Micro-zones agents
+                </button>
+                <button
+                  className={mapMode === "bu_zone" ? "px-3 py-2 bg-black text-white rounded" : "px-3 py-2 border rounded"}
+                  onClick={() => setMapMode("bu_zone")}
+                >
+                  Zone BU
+                </button>
+              </div>
             </div>
-            <div className="text-xs text-gray-500">
-              Hover un agent ↔ highlight sur la carte. Clique sur une microzone ↔ sélectionne l’agent.
-            </div>
+
+            {mapMode === "territory" ? (
+              <>
+                <div className="text-sm text-gray-600">
+                  User sélectionné :{" "}
+                  <span className="font-mono">{selectedUser ? `${selectedUser.name} (#${selectedUser.id})` : "—"}</span>
+                </div>
+                <div className="text-xs text-gray-500">
+                  Hover un agent ↔ highlight sur la carte. Clique sur une microzone ↔ sélectionne l’agent.
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-sm text-gray-600">
+                  Zone BU actuelle :{" "}
+                  <span className="font-mono">{zone ? `${zone.name} (#${zone.id})` : "— (aucune zone liée)"}</span>
+                </div>
+                <div className="text-xs text-gray-500">
+                  Dessine le polygone qui définit le garde-fou BU. Sans Zone BU, l’agent ne verra rien.
+                </div>
+              </>
+            )}
           </div>
 
           <AdminMapDraw
             apiBase={API_BASE}
             adminUserId={ADMIN_USER_ID}
             agencyId={agencyId}
-            users={users} // ✅ to show names in tooltips/popups
+            users={users}
             selectedUserId={selectedUserId}
             hoveredUserId={hoveredUserId}
-            onSelectUserId={setSelectedUserId}
-            onHoverUserId={setHoveredUserId}
+            onSelectUserId={handleSelectUserId}
+            onHoverUserId={handleHoverUserId}
             zoneGeoJsonString={zone?.geojson ?? null}
+            mode={mapMode}
           />
         </div>
       </section>

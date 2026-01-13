@@ -9,7 +9,6 @@ License : MIT
 ─────────────────────────────────────────────────────────────
 """
 
-
 import psycopg
 from contextlib import contextmanager
 
