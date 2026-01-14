@@ -22,7 +22,7 @@ import type { Note, Target } from '../../app/types';
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
 // MVP no-auth
-const DEV_USER_ID = 1;
+const DEV_USER_ID = 2;
 
 const TOUR_MAX = 8;
 const TOUR_STORAGE_KEY = (userId: number, zoneId: number | null) =>
@@ -38,7 +38,7 @@ function normalizeTourIds(raw: unknown, allTargets: Target[], max = TOUR_MAX): n
     if (typeof x !== 'number') continue;
     const t = byId.get(x);
     if (!t) continue;
-    if (t.status !== 'non_traite') continue; // tournée = actionnables only
+    if (t.status !== 'non_traite') continue;
     if (cleaned.includes(x)) continue;
     cleaned.push(x);
     if (cleaned.length >= max) break;
@@ -53,7 +53,15 @@ export default function ProspectionPage() {
   const [zoneName, setZoneName] = useState<string>('');
   const [zoneGeoJson, setZoneGeoJson] = useState<GeoJsonObject | null>(null);
 
-  // ✅ NEW: distinguish “job done” vs “no territory”
+  // ✅ agent identity + BU identity
+  const [agentName, setAgentName] = useState<string>('');
+  const [agencyName, setAgencyName] = useState<string>('');
+
+  // ✅ micro-zone agent
+  const [territoryName, setTerritoryName] = useState<string>('');
+  const [territoryGeoJson, setTerritoryGeoJson] = useState<GeoJsonObject | null>(null);
+
+  // ✅ distinguish “job done” vs “no territory”
   const [hasTerritory, setHasTerritory] = useState<boolean | null>(null);
 
   const [selectedAddress, setSelectedAddress] = useState<string | null>(null);
@@ -274,7 +282,11 @@ export default function ProspectionPage() {
     return [...tourOrdered, ...rest];
   }, [activeTargets, tourIds, tourSet]);
 
-  // ✅ Load effective zone + has_territory
+  // ✅ Load effective zone + has_territory + agent/BU + micro-zone
+  // Backend response is currently in "flat" dev format:
+  //   { item, agency_name, user_name, has_territory, territory_name, territory_geojson }
+  // but we also support the newer nested format:
+  //   { me:{name}, agency:{name}, has_territory, territory:{name, geojson}, item:{...} }
   useEffect(() => {
     let cancelled = false;
 
@@ -290,8 +302,33 @@ export default function ProspectionPage() {
 
         if (cancelled) return;
 
+        // ----- identity (support both shapes)
+        const userName = String(data?.user_name ?? data?.me?.name ?? '');
+        const buName = String(data?.agency_name ?? data?.agency?.name ?? '');
+        setAgentName(userName);
+        setAgencyName(buName);
+
+        // ----- territory (support both shapes)
+        const terrName = String(data?.territory_name ?? data?.territory?.name ?? '');
+        setTerritoryName(terrName);
+
+        const terrGeoStr: unknown =
+          data?.territory_geojson ?? data?.territory?.geojson ?? null;
+
+        if (typeof terrGeoStr === 'string' && terrGeoStr.trim()) {
+          try {
+            setTerritoryGeoJson(JSON.parse(terrGeoStr) as GeoJsonObject);
+          } catch {
+            setTerritoryGeoJson(null);
+          }
+        } else {
+          setTerritoryGeoJson(null);
+        }
+
+        // has_territory
         setHasTerritory(typeof data?.has_territory === 'boolean' ? data.has_territory : null);
 
+        // ----- BU zone
         if (!item) {
           setZoneId(null);
           setZoneName('');
@@ -338,7 +375,24 @@ export default function ProspectionPage() {
         if (!res.ok) return;
 
         const data = await res.json();
-        const items: Target[] = data.items ?? [];
+        const raw = Array.isArray(data?.items) ? data.items : [];
+
+        const items: Target[] = raw.map((t: any) => ({
+          id: Number(t.id),
+          address: String(t.address ?? ''),
+          address_extra: t.address_extra == null ? null : String(t.address_extra),
+
+          surface: t.surface == null ? null : Number(t.surface),
+          date: t.date == null ? null : String(t.date),
+          latitude: Number(t.latitude),
+          longitude: Number(t.longitude),
+          status: t.status,
+          next_action_at: t.next_action_at == null ? null : String(t.next_action_at),
+
+          // keep raw fields if present
+          ...(t.etage_raw !== undefined ? { etage_raw: t.etage_raw } : {}),
+          ...(t.complement_raw !== undefined ? { complement_raw: t.complement_raw } : {}),
+        }));
 
         if (!cancelled) setTargets(items);
       } catch (e) {
@@ -466,7 +520,6 @@ export default function ProspectionPage() {
     await loadNotes(selectedAddress);
   };
 
-  // ✅ Empty state message (decides if “Job’s done” is valid)
   const emptyState =
     zoneId !== null && targets.length === 0
       ? hasTerritory === false
@@ -479,10 +532,23 @@ export default function ProspectionPage() {
 
   return (
     <main className="p-10 space-y-10">
+      {/* ✅ RESTORED HEADER */}
       <header className="space-y-2">
         <h1 className="text-4xl font-bold">PROSPECTOR</h1>
-        <div className="text-sm text-gray-600">
-          Zone BU : <span className="font-medium">{zoneName || '—'}</span>
+
+        <div className="text-sm text-gray-700 flex flex-wrap gap-x-6 gap-y-1">
+          <div>
+            Agent : <span className="font-semibold">{agentName || `#${DEV_USER_ID}`}</span>
+          </div>
+          <div>
+            BU : <span className="font-semibold">{agencyName || '—'}</span>
+          </div>
+          <div>
+            Zone BU : <span className="font-semibold">{zoneName || '—'}</span>
+          </div>
+          <div>
+            Micro-zone agent : <span className="font-semibold">{territoryName || '—'}</span>
+          </div>
         </div>
       </header>
 
@@ -522,6 +588,9 @@ export default function ProspectionPage() {
               tourPolyline={tourPolyline}
               maxPins={60}
               zoneGeoJson={zoneGeoJson}
+              zoneName={zoneName}
+              territoryGeoJson={territoryGeoJson}
+              territoryName={territoryName}
               focusedTargetId={focusedTargetId}
               highlightedTargetId={highlightedTargetId}
               onHoverTarget={setHoveredTargetId}

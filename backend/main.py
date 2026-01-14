@@ -1,9 +1,10 @@
+
 """
 ─────────────────────────────────────────────────────────────
 Project : prospector
 File    : main.py
 Author  : Antoine Astruc
-Email   : antoine@maisonastruc.fr
+Email   : Antoine Astruc
 Created : 2026-01-08
 License : MIT
 ─────────────────────────────────────────────────────────────
@@ -13,7 +14,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +36,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # -----------------------------------------------------------------------------
 # DEV CONTEXT (no-auth MVP)
@@ -77,16 +77,14 @@ class AutoRouteRequest(BaseModel):
 class AdminUserCreate(BaseModel):
     name: str
     agency_id: int
-    email: Optional[str] = None  # ✅ optionnel
-    role: str = "agent"  # ✅ default
+    email: Optional[str] = None
+    role: str = "agent"
     min_surface_m2: Optional[float] = None
     max_surface_m2: Optional[float] = None
 
 
 class AdminTerritoryUpsert(BaseModel):
-    # ✅ Front sends "name" already
     name: str
-    # GeoJSON object: Polygon or MultiPolygon (geometry object)
     geojson: Dict[str, Any]
 
 
@@ -117,11 +115,56 @@ def _get_user_agency(cur, user_id: int) -> int:
     return int(row[0])
 
 
-def _user_has_territory(cur, user_id: int) -> bool:
+def _get_user_and_agency_names(cur, user_id: int) -> Tuple[str, int, str]:
+    """
+    Returns: (user_name, agency_id, agency_name)
+
+    Robust in dev:
+    - If 'agencies' table exists: uses it.
+    - If it doesn't exist (or query fails): falls back to "BU #<agency_id>".
+    """
+    cur.execute("SELECT id, name, agency_id FROM users WHERE id = %s;", (user_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="User inconnu")
+
+    user_name = str(row[1] or "")
+    agency_id = int(row[2])
+
+    agency_name = f"BU #{agency_id}"
+    try:
+        cur.execute("SELECT name FROM agencies WHERE id = %s;", (agency_id,))
+        arow = cur.fetchone()
+        if arow and arow[0]:
+            agency_name = str(arow[0])
+    except Exception:
+        agency_name = f"BU #{agency_id}"
+
+    return user_name, agency_id, agency_name
+
+
+def _get_user_territory_geojson(
+    cur, user_id: int, agency_id: int
+) -> Optional[Tuple[str, str]]:
+    """
+    Returns (territory_name, geojson_string) or None.
+    Tenant-safe: filtered by (user_id, agency_id).
+    """
     cur.execute(
-        "SELECT 1 FROM user_territories WHERE user_id = %s LIMIT 1;", (user_id,)
+        """
+        SELECT name, ST_AsGeoJSON(geom)
+        FROM user_territories
+        WHERE user_id = %s
+          AND agency_id = %s
+        ORDER BY id DESC
+        LIMIT 1;
+        """,
+        (user_id, agency_id),
     )
-    return cur.fetchone() is not None
+    row = cur.fetchone()
+    if not row or row[1] is None:
+        return None
+    return str(row[0]), str(row[1])
 
 
 def _get_primary_agency_zone(cur, agency_id: int) -> Optional[int]:
@@ -184,28 +227,60 @@ def read_root():
 
 
 # -----------------------------------------------------------------------------
-# Zone effective (celle de la BU de l'agent) + has_territory
+# Zone effective (BU) + micro-zone + identity (BU + agent)
 # -----------------------------------------------------------------------------
-
+# IMPORTANT: contract for frontend:
+#  - agency_name: string
+#  - user_name: string
+#  - has_territory: bool
+#  - territory_geojson: string | null   (GeoJSON geometry string, not object)
+#  - item: {id, name, geojson} | null   (BU zone)
+# -----------------------------------------------------------------------------
 
 @app.get("/me/zone")
 def get_my_zone(user_id: Optional[int] = Query(default=None)):
+    """
+    Backward compatible response:
+      - keeps: item (BU zone)
+    Adds for demo / agent UX:
+      - agency_name
+      - user_name
+      - territory_geojson (string) + territory_name (optional)
+      - has_territory
+    """
     uid = _resolve_user_id(user_id)
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            agency_id = _get_user_agency(cur, uid)
-            has_territory = _user_has_territory(cur, uid)
+            user_name, agency_id, agency_name = _get_user_and_agency_names(cur, uid)
+
+            territory_row = _get_user_territory_geojson(cur, uid, agency_id)
+            has_territory = territory_row is not None
+            territory_name = territory_row[0] if territory_row else None
+            territory_geojson = territory_row[1] if territory_row else None
 
             zone_id = _get_primary_agency_zone(cur, agency_id)
             if zone_id is None:
-                return {"item": None, "has_territory": has_territory}
+                return {
+                    "item": None,  # BU zone
+                    "agency_name": agency_name,
+                    "user_name": user_name,
+                    "has_territory": has_territory,
+                    "territory_name": territory_name,
+                    "territory_geojson": territory_geojson,
+                }
 
-            zid, name, geojson = _get_zone_geojson(cur, zone_id)
+            zid, zname, zgeojson = _get_zone_geojson(cur, zone_id)
+
+    zone_item = {"id": zid, "name": zname, "geojson": zgeojson}
 
     return {
-        "item": {"id": zid, "name": name, "geojson": geojson},
+        "item": zone_item,
+        "agency_name": agency_name,
+        "user_name": user_name,
         "has_territory": has_territory,
+        "territory_name": territory_name,
+        "territory_geojson": territory_geojson,
     }
 
 
@@ -355,7 +430,6 @@ def admin_upsert_user_territory(
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            # Ensure user exists + fetch agency_id (required by DB)
             cur.execute("SELECT agency_id FROM users WHERE id = %s;", (user_id,))
             urow = cur.fetchone()
             if urow is None:
@@ -367,10 +441,6 @@ def admin_upsert_user_territory(
 
             geo_str = json.dumps(payload.geojson)
 
-            # ✅ Conform to schema:
-            # - agency_id NOT NULL
-            # - name NOT NULL
-            # - geom MultiPolygon SRID 4326 NOT NULL
             cur.execute(
                 """
                 INSERT INTO user_territories (user_id, agency_id, name, geom)
@@ -448,24 +518,22 @@ def admin_upsert_bu_zone(
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            # MVP: 1 zone active par agency => overwrite association
             existing_zone_id = _get_primary_agency_zone(cur, agency_id)
 
             if existing_zone_id is None:
-                # Create zone
                 cur.execute(
                     """
                     WITH g AS (
-                    SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)) AS geom
+                      SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)) AS geom
                     )
                     INSERT INTO zones (name, min_lat, max_lat, min_lng, max_lng, geom)
                     SELECT
-                    %s,
-                    ST_YMin(geom) AS min_lat,
-                    ST_YMax(geom) AS max_lat,
-                    ST_XMin(geom) AS min_lng,
-                    ST_XMax(geom) AS max_lng,
-                    geom
+                      %s,
+                      ST_YMin(geom) AS min_lat,
+                      ST_YMax(geom) AS max_lat,
+                      ST_XMin(geom) AS min_lng,
+                      ST_XMax(geom) AS max_lng,
+                      geom
                     FROM g
                     RETURNING id;
                     """,
@@ -473,42 +541,35 @@ def admin_upsert_bu_zone(
                 )
                 zid = int(cur.fetchone()[0])
 
-                # Ensure single link for agency
-                cur.execute(
-                    "DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,)
-                )
+                cur.execute("DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,))
                 cur.execute(
                     "INSERT INTO agency_zones (agency_id, zone_id) VALUES (%s, %s);",
                     (agency_id, zid),
                 )
             else:
                 zid = int(existing_zone_id)
-                # Update zone geometry + name
                 cur.execute(
                     """
-                        WITH g AS (
-                        SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)) AS geom
-                        )
-                        UPDATE zones z
-                        SET
-                        name = %s,
-                        geom = g.geom,
-                        min_lat = ST_YMin(g.geom),
-                        max_lat = ST_YMax(g.geom),
-                        min_lng = ST_XMin(g.geom),
-                        max_lng = ST_XMax(g.geom)
-                        FROM g
-                        WHERE z.id = %s;
-                        """,
+                    WITH g AS (
+                      SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)) AS geom
+                    )
+                    UPDATE zones z
+                    SET
+                      name = %s,
+                      geom = g.geom,
+                      min_lat = ST_YMin(g.geom),
+                      max_lat = ST_YMax(g.geom),
+                      min_lng = ST_XMin(g.geom),
+                      max_lng = ST_XMax(g.geom)
+                    FROM g
+                    WHERE z.id = %s;
+                    """,
                     (geo_str, zone_name, zid),
                 )
                 if cur.rowcount == 0:
                     raise HTTPException(status_code=404, detail="Zone non trouvée")
 
-                # Ensure link exists (and unique)
-                cur.execute(
-                    "DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,)
-                )
+                cur.execute("DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,))
                 cur.execute(
                     "INSERT INTO agency_zones (agency_id, zone_id) VALUES (%s, %s);",
                     (agency_id, zid),
@@ -529,7 +590,6 @@ def admin_delete_bu_zone(
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            # remove association (non destructive for zones table)
             cur.execute("DELETE FROM agency_zones WHERE agency_id = %s;", (agency_id,))
         conn.commit()
 
@@ -540,13 +600,13 @@ def admin_delete_bu_zone(
 # Admin - list micro-zones for a BU (agency)
 # -----------------------------------------------------------------------------
 
-
 @app.get("/admin/territories")
 def admin_list_territories(
     admin_user_id: int = Query(...),
     agency_id: int = Query(...),
 ):
-    _ = _resolve_user_id(admin_user_id)
+    admin_uid = _resolve_user_id(admin_user_id)
+    _assert_admin(admin_uid)
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -595,7 +655,8 @@ def get_dpe(user_id: Optional[int] = Query(default=None)):
         with conn.cursor() as cur:
             agency_id = _get_user_agency(cur, uid)
 
-            if not _user_has_territory(cur, uid):
+            # micro-zone mandatory
+            if _get_user_territory_geojson(cur, uid, agency_id) is None:
                 return {"items": []}
 
             zone_id = _get_primary_agency_zone(cur, agency_id)
@@ -607,6 +668,8 @@ def get_dpe(user_id: Optional[int] = Query(default=None)):
                 SELECT
                   t.id,
                   t.address,
+                  t.address_extra,
+                  t.etage_raw,
                   t.surface_m2,
                   t.diagnostic_date,
                   t.latitude,
@@ -623,13 +686,14 @@ def get_dpe(user_id: Optional[int] = Query(default=None)):
                     SELECT 1
                     FROM user_territories ut
                     WHERE ut.user_id = %s
+                      AND ut.agency_id = %s
                       AND ST_Intersects(ut.geom, t.geom)
                   )
                   AND (u.min_surface_m2 IS NULL OR t.surface_m2 >= u.min_surface_m2)
                   AND (u.max_surface_m2 IS NULL OR t.surface_m2 <= u.max_surface_m2)
                 ORDER BY t.id;
                 """,
-                (zone_id, uid, agency_id, uid),
+                (zone_id, uid, agency_id, uid, agency_id),
             )
             rows = cur.fetchall()
 
@@ -639,12 +703,14 @@ def get_dpe(user_id: Optional[int] = Query(default=None)):
             {
                 "id": r[0],
                 "address": r[1],
-                "surface": float(r[2]) if r[2] is not None else None,
-                "date": r[3].isoformat() if r[3] is not None else None,
-                "latitude": r[4],
-                "longitude": r[5],
-                "status": r[6],
-                "next_action_at": r[7].isoformat() if r[7] is not None else None,
+                "address_extra": r[2],  # RAW
+                "etage_raw": r[3],  # RAW (0 = rien)
+                "surface": float(r[4]) if r[4] is not None else None,
+                "date": r[5].isoformat() if r[5] is not None else None,
+                "latitude": r[6],
+                "longitude": r[7],
+                "status": r[8],
+                "next_action_at": r[9].isoformat() if r[9] is not None else None,
             }
         )
 
@@ -713,7 +779,8 @@ def route_auto(payload: AutoRouteRequest):
         with conn.cursor() as cur:
             agency_id = _get_user_agency(cur, uid)
 
-            if not _user_has_territory(cur, uid):
+            # micro-zone mandatory
+            if _get_user_territory_geojson(cur, uid, agency_id) is None:
                 return {"target_ids_ordered": [], "polyline": None}
 
             zone_id = _get_primary_agency_zone(cur, agency_id)
@@ -734,6 +801,7 @@ def route_auto(payload: AutoRouteRequest):
                     SELECT 1
                     FROM user_territories ut
                     WHERE ut.user_id = %s
+                      AND ut.agency_id = %s
                       AND ST_Intersects(ut.geom, t.geom)
                   )
                   AND (u.min_surface_m2 IS NULL OR t.surface_m2 >= u.min_surface_m2)
@@ -741,7 +809,7 @@ def route_auto(payload: AutoRouteRequest):
                 ORDER BY t.id DESC
                 LIMIT %s;
                 """,
-                (zone_id, uid, agency_id, uid, POOL_MAX),
+                (zone_id, uid, agency_id, uid, agency_id, POOL_MAX),
             )
             rows = cur.fetchall()
 
@@ -777,9 +845,7 @@ def route_auto(payload: AutoRouteRequest):
 
     ids = [p["id"] for p in ordered]
     coords = [[p["lng"], p["lat"]] for p in ordered]
-    polyline = (
-        {"type": "LineString", "coordinates": coords} if len(coords) >= 2 else None
-    )
+    polyline = {"type": "LineString", "coordinates": coords} if len(coords) >= 2 else None
 
     return {"target_ids_ordered": ids, "polyline": polyline}
 
