@@ -22,7 +22,7 @@ import type { Note, Target } from '../../app/types';
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
 // MVP no-auth
-const DEV_USER_ID = 2;
+const DEV_USER_ID = 12;
 
 const TOUR_MAX = 8;
 const TOUR_STORAGE_KEY = (userId: number, zoneId: number | null) =>

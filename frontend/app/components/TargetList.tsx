@@ -14,7 +14,9 @@
 import { useMemo, useState } from 'react';
 import type { Target } from '../types';
 
-type EmptyState = { kind: 'no_territory'; message: string } | { kind: 'job_done'; message: string };
+type EmptyState =
+  | { kind: 'no_territory'; message: string }
+  | { kind: 'job_done'; message: string };
 
 type Props = {
   activeTargets: Target[];
@@ -69,20 +71,19 @@ function buildNotesKey(t: Target): string {
   return complement ? `${t.address} — ${complement}` : t.address;
 }
 
-function formatTargetDetails(t: Target): string[] {
+type DetailChip = { kind: 'complement' | 'floor'; label: string };
+
+function buildDetailChips(t: Target): DetailChip[] {
   // ✅ DECISION: display RAW only
-  // - si complement_raw existe → afficher en premier
-  // - si etage_raw > 0 → afficher "Étage : X"
-  // - si etage_raw = 0 → ne rien afficher
-  const lines: string[] = [];
+  const chips: DetailChip[] = [];
 
   const complement = getComplementRaw(t);
-  if (complement) lines.push(complement);
+  if (complement) chips.push({ kind: 'complement', label: complement });
 
   const floor = getEtageRaw(t);
-  if (floor > 0) lines.push(`Étage : ${floor}`);
+  if (floor > 0) chips.push({ kind: 'floor', label: `Étage ${floor}` });
 
-  return lines;
+  return chips;
 }
 
 export default function TargetList({
@@ -160,14 +161,30 @@ export default function TargetList({
   const topBtnDisabled = 'bg-gray-700/60 text-white/50';
   const topBtnEnabled = 'bg-blue-600 hover:bg-blue-700';
 
-  const itemBase = 'border p-3 rounded cursor-pointer transition';
-  const itemFocused = 'ring-2 ring-blue-400 bg-gray-200';
-  const itemHover = 'hover:bg-gray-100';
+  // ✅ UI: less "white", more transparent grey (clean/premium)
+  const itemBase =
+    // ✅ Slightly grey blocks so items are clearly separated (still clean)
+    'border border-black/10 rounded cursor-pointer transition px-3 py-3 bg-gray-800/90 shadow-sm';
+  const itemFocused = 'ring-2 ring-blue-400 bg-gray-700/90 shadow-sm';
+  const itemHover = 'hover:bg-gray-700/80 hover:border-white/20';
 
   const attachHoverHandlers = (id: number) => ({
     onMouseEnter: () => onHoverTarget?.(id),
     onMouseLeave: () => onHoverTarget?.(null),
   });
+
+  // Detail chips styles (more readable but still clean)
+  const chipBase =
+    // ✅ Make complement/floor info *pop* (high contrast, premium)
+    'inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs font-semibold tracking-tight';
+  const chipComplement = 'bg-gray-900/80 border-white/10 text-gray-50';
+  const chipFloor = 'bg-gray-800/70 border-white/10 text-gray-50';
+
+  const iconForKind = (kind: DetailChip['kind']) => {
+    // simple unicode icons (no dependency)
+    if (kind === 'complement') return '📍';
+    return '🏢';
+  };
 
   return (
     <section className="space-y-6">
@@ -229,8 +246,8 @@ export default function TargetList({
               {tourLoading
                 ? 'Génération…'
                 : safeTourIds.length > 0
-                ? 'Réinitialiser la tournée'
-                : 'Tournée automatique'}
+                  ? 'Réinitialiser la tournée'
+                  : 'Tournée automatique'}
             </button>
           </div>
         </div>
@@ -249,7 +266,7 @@ export default function TargetList({
               const pos = tourIndex.get(t.id);
               const isFocused = focusedTargetId === t.id;
 
-              const detailLines = formatTargetDetails(t);
+              const chips = buildDetailChips(t);
               const notesKey = buildNotesKey(t);
 
               return (
@@ -261,9 +278,9 @@ export default function TargetList({
                   title="Centrer sur la carte"
                 >
                   <div className="flex items-start justify-between gap-4">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <strong>{t.address}</strong>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <strong className="truncate">{t.address}</strong>
                         {pos ? (
                           <span className="px-2 py-0.5 text-xs rounded bg-blue-600 text-white">
                             #{pos}
@@ -271,20 +288,25 @@ export default function TargetList({
                         ) : null}
                       </div>
 
-                      {/* ✅ NO PLACEHOLDER: only show if we have raw details */}
-                      {detailLines.length > 0 ? (
-                        <div className="text-sm text-gray-600 mt-1 space-y-0.5">
-                          {detailLines.map((line, i) => (
-                            <div key={i}>{line}</div>
+                      {/* ✅ More readable details: chips (clean + bold) */}
+                      {chips.length > 0 ? (
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          {chips.map((c, i) => (
+                            <span
+                              key={i}
+                              className={[chipBase, c.kind === 'complement' ? chipComplement : chipFloor].join(' ')}
+                            >
+                              <span aria-hidden>{iconForKind(c.kind)}</span>
+                              <span className="max-w-[520px] truncate">{c.label}</span>
+                            </span>
                           ))}
                         </div>
                       ) : null}
 
-                      <div className="text-sm text-gray-400 mt-1">
+                      <div className="text-sm text-gray-500 mt-2">
                         {t.surface ?? '—'} m² — <span className="font-mono">{t.status}</span>
                       </div>
 
-                      {/* ✅ Remove "()" bug: only render date line if exists */}
                       {t.date ? <div className="text-sm text-gray-500 mt-1">{t.date}</div> : null}
                     </div>
 
@@ -312,9 +334,7 @@ export default function TargetList({
                                 ? 'px-3 py-1 bg-gray-200 text-gray-500 rounded cursor-not-allowed'
                                 : 'px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700'
                             }
-                            title={
-                              tourFull ? `Limite atteinte (${TOUR_MAX})` : 'Ajouter à la tournée'
-                            }
+                            title={tourFull ? `Limite atteinte (${TOUR_MAX})` : 'Ajouter à la tournée'}
                           >
                             Ajouter
                           </button>
@@ -357,11 +377,7 @@ export default function TargetList({
                           onOpenNotes(notesKey);
                         }}
                         className="px-3 py-1 bg-black text-white rounded hover:opacity-90 transition"
-                        title={
-                          notesKey === t.address
-                            ? 'Notes (adresse)'
-                            : 'Notes (adresse + complément)'
-                        }
+                        title={notesKey === t.address ? 'Notes (adresse)' : 'Notes (adresse + complément)'}
                       >
                         Notes
                       </button>
@@ -390,7 +406,7 @@ export default function TargetList({
             <ul className="space-y-2 mt-3">
               {filteredInactive.map((t) => {
                 const isFocused = focusedTargetId === t.id;
-                const detailLines = formatTargetDetails(t);
+                const chips = buildDetailChips(t);
                 const notesKey = buildNotesKey(t);
 
                 return (
@@ -402,22 +418,27 @@ export default function TargetList({
                     title="Centrer sur la carte"
                   >
                     <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <div>
+                      <div className="min-w-0">
+                        <div className="truncate">
                           <strong>{t.address}</strong> — {t.surface ?? '—'} m² —{' '}
                           <span className="font-mono">{t.status}</span>
                         </div>
 
-                        {/* ✅ same RAW display rules */}
-                        {detailLines.length > 0 ? (
-                          <div className="text-sm text-gray-600 mt-1 space-y-0.5">
-                            {detailLines.map((line, i) => (
-                              <div key={i}>{line}</div>
+                        {chips.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            {chips.map((c, i) => (
+                              <span
+                                key={i}
+                                className={[chipBase, c.kind === 'complement' ? chipComplement : chipFloor].join(' ')}
+                              >
+                                <span aria-hidden>{iconForKind(c.kind)}</span>
+                                <span className="max-w-[520px] truncate">{c.label}</span>
+                              </span>
                             ))}
                           </div>
                         ) : null}
 
-                        {t.date ? <div className="text-sm text-gray-500 mt-1">{t.date}</div> : null}
+                        {t.date ? <div className="text-sm text-gray-500 mt-2">{t.date}</div> : null}
                       </div>
 
                       <div className="flex flex-wrap gap-2">
@@ -437,11 +458,7 @@ export default function TargetList({
                             onOpenNotes(notesKey);
                           }}
                           className="px-3 py-1 bg-black text-white rounded hover:opacity-90 transition"
-                          title={
-                            notesKey === t.address
-                              ? 'Notes (adresse)'
-                              : 'Notes (adresse + complément)'
-                          }
+                          title={notesKey === t.address ? 'Notes (adresse)' : 'Notes (adresse + complément)'}
                         >
                           Notes
                         </button>
