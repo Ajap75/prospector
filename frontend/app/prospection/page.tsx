@@ -22,7 +22,7 @@ import type { Note, Target } from '../../app/types';
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
 // MVP no-auth
-const DEV_USER_ID = 12;
+const DEV_USER_ID = 11;
 
 const TOUR_MAX = 8;
 const TOUR_STORAGE_KEY = (userId: number, zoneId: number | null) =>
@@ -534,20 +534,20 @@ export default function ProspectionPage() {
     <main className="p-10 space-y-10">
       {/* ✅ RESTORED HEADER */}
       <header className="space-y-2">
-        <h1 className="text-4xl font-bold">PROSPECTOR</h1>
+        <h1 className="text-6xl font-semibold tracking-tight text-gray-800">PROSPECTOR</h1>
 
-        <div className="text-sm text-gray-700 flex flex-wrap gap-x-6 gap-y-1">
+        <div className="text-lg text-gray-500 flex flex-wrap gap-x-10 gap-y-3">
           <div>
-            Agent : <span className="font-semibold">{agentName || `#${DEV_USER_ID}`}</span>
+            Agent : <span className="font-semibold text-gray-800">{agentName || `#${DEV_USER_ID}`}</span>
           </div>
           <div>
-            BU : <span className="font-semibold">{agencyName || '—'}</span>
+            BU : <span className="font-semibold text-gray-800">{agencyName || '—'}</span>
           </div>
           <div>
-            Zone BU : <span className="font-semibold">{zoneName || '—'}</span>
+            Zone BU : <span className="font-semibold text-gray-800">{zoneName || '—'}</span>
           </div>
           <div>
-            Micro-zone agent : <span className="font-semibold">{territoryName || '—'}</span>
+            Micro-zone agent : <span className="font-semibold text-gray-800">{territoryName || '—'}</span>
           </div>
         </div>
       </header>

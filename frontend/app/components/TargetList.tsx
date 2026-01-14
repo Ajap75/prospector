@@ -106,6 +106,9 @@ export default function TargetList({
   onHoverTarget,
   emptyState = null,
 }: Props) {
+  // ✅ Safety: when the cursor leaves the whole list area, force-clear hover
+  const clearHover = () => onHoverTarget?.(null);
+
   const safeTourIds = Array.isArray(tourIds) ? tourIds : [];
   const safeActive = Array.isArray(activeTargets) ? activeTargets : [];
   const safeInactive = Array.isArray(inactiveTargets) ? inactiveTargets : [];
@@ -187,7 +190,7 @@ export default function TargetList({
   };
 
   return (
-    <section className="space-y-6">
+    <section className="space-y-6" onMouseLeave={clearHover}>
       <div>
         <div className="flex items-center justify-between mb-3 gap-4">
           <h2 className="text-2xl font-semibold whitespace-nowrap">Targets actifs</h2>
@@ -259,7 +262,7 @@ export default function TargetList({
             Aucun résultat{isFiltering ? ` pour “${query.trim()}”` : ''}.
           </div>
         ) : (
-          <ul className="space-y-2">
+          <ul className="space-y-2" onMouseLeave={clearHover}>
             {filteredActive.map((t) => {
               const inTour = tourSet.has(t.id);
               const tourEligible = t.status === 'non_traite';
@@ -390,7 +393,7 @@ export default function TargetList({
         )}
       </div>
 
-      <details className="border rounded">
+      <details className="border rounded" onMouseLeave={clearHover}>
         <summary className="cursor-pointer select-none px-4 py-3 font-semibold">
           Inactifs ({filteredInactive.length}/{safeInactive.length})
         </summary>
