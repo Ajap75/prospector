@@ -1,7 +1,7 @@
 /**
  * ─────────────────────────────────────────────────────────────
  * Project : prospector
- * File    : ProspectionPage.tsx
+ * File    : page.tsx
  * Author  : Antoine Astruc
  * Email   : antoine@maisonastruc.fr
  * Created : 2026-01-08
@@ -22,7 +22,7 @@ import type { Note, Target } from '../../app/types';
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
 // MVP no-auth
-const DEV_USER_ID = 11;
+const DEV_USER_ID = 15;
 
 const TOUR_MAX = 8;
 const TOUR_STORAGE_KEY = (userId: number, zoneId: number | null) =>
